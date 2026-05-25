@@ -83,6 +83,53 @@ function dedupeCrossLinks(links: CrossLink[]): CrossLink[] {
   return out;
 }
 
+// Fix 16B: eliminate multi-claimant FP where multiple contractIds for the
+// same symbol resolve to the same target file (wrong-artifact FP) or to
+// N/A (local-class FP). Runs after dedupeCrossLinks.
+function dedupeMultiClaimantCrossLinks(links: CrossLink[]): CrossLink[] {
+  const byKey = new Map<string, CrossLink[]>();
+  for (const link of links) {
+    const parts = link.contractId.split('::');
+    const type = parts[0];
+    const symbol = parts.slice(2).join('::');
+    const gk = `${type}\0${symbol}\0${link.from?.repo || ''}`;
+    if (!byKey.has(gk)) byKey.set(gk, []);
+    byKey.get(gk)!.push(link);
+  }
+  const out: CrossLink[] = [];
+  let dropped = 0;
+  for (const [, group] of byKey) {
+    if (group.length === 1) {
+      out.push(group[0]);
+      continue;
+    }
+    const resolved = group.filter((l) => l.to?.symbolRef?.filePath);
+    if (resolved.length === 0) {
+      // All N/A — likely local-class FP; keep first only
+      out.push(group[0]);
+      dropped += group.length - 1;
+      continue;
+    }
+    const uniqueFiles = [...new Set(resolved.map((l) => l.to.symbolRef.filePath))];
+    if (uniqueFiles.length === 1) {
+      // Same target — prefer the link whose artifact appears in the file path
+      const fp = uniqueFiles[0];
+      const best =
+        resolved.find((l) => {
+          const art = l.contractId.split('::')[1];
+          return fp.includes('/' + art + '/') || fp.includes('\\' + art + '\\');
+        }) ?? resolved[0];
+      out.push(best);
+      dropped += group.length - 1;
+    } else {
+      // Different targets — genuine multi-target, keep all
+      out.push(...group);
+    }
+  }
+  if (dropped > 0) logger.info(`[group/sync] deduplicated ${dropped} multi-claimant cross-links`);
+  return out;
+}
+
 export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promise<SyncResult> {
   const missingRepos: string[] = [];
   const repoSnapshots: Record<string, RepoSnapshot> = {};
@@ -269,7 +316,9 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
   // manifest-declared link can also emit a matchType:'exact' CrossLink with the
   // same endpoints. Prefer the manifest version — it reflects operator intent
   // and carries matchType:'manifest' which downstream consumers may rely on.
-  const crossLinks = dedupeCrossLinks([...manifestCrossLinks, ...matched, ...wildcard.matched]);
+  const crossLinks = dedupeMultiClaimantCrossLinks(
+    dedupeCrossLinks([...manifestCrossLinks, ...matched, ...wildcard.matched]),
+  );
   const allContracts: StoredContract[] = autoContracts;
 
   const registry: ContractRegistry = {
