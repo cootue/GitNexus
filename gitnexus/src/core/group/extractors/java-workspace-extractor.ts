@@ -29,6 +29,12 @@ interface InheritanceOrOverrideSymbol {
   relType: 'extends' | 'implements' | 'override';
 }
 
+interface XmlRefSymbol {
+  artifactKey: string;
+  symbolName: string;
+  filePath: string;
+}
+
 interface PomResult {
   groupId: string;
   artifactId: string;
@@ -676,6 +682,118 @@ async function scanJavaOverride(
   return results;
 }
 
+// Walk resource files (.xml, .properties, .tld, .drl) for FQN scanning.
+// Skips pom.xml since Maven deps are already handled by parseJavaManifest.
+async function findResourceFiles(repoPath: string): Promise<string[]> {
+  const results: string[] = [];
+  const ig = await loadIgnoreRules(repoPath);
+
+  async function walk(dir: string, rel: string): Promise<void> {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (shouldIgnorePath(childRel)) continue;
+        if (ig && ig.ignores(childRel + '/')) continue;
+        await walk(path.join(dir, entry.name), childRel);
+      } else {
+        const lower = entry.name.toLowerCase();
+        if (lower === 'pom.xml') continue;
+        if (
+          !(
+            lower.endsWith('.xml') ||
+            lower.endsWith('.properties') ||
+            lower.endsWith('.tld') ||
+            lower.endsWith('.drl')
+          )
+        )
+          continue;
+        if (shouldIgnorePath(childRel)) continue;
+        if (ig && ig.ignores(childRel)) continue;
+        results.push(childRel);
+      }
+    }
+  }
+
+  await walk(repoPath, '');
+  return results;
+}
+
+// Scan resource files for FQN references to types provided by known group
+// packages. Uses knownPackages multi-map for filtering — no hardcoded
+// namespace prefix. Each unique (file, symbol) pair is emitted once as
+// `xml-ref` so the manifest-extractor surfaces the resource file in
+// cross-impact reports when the referenced symbol changes.
+async function scanResourceFqnReferences(
+  repoPath: string,
+  knownPackages: Map<string, Set<string>>,
+): Promise<XmlRefSymbol[]> {
+  const results: XmlRefSymbol[] = [];
+  const sortedPkgs = [...knownPackages.entries()].sort((a, b) => b[0].length - a[0].length);
+
+  // Build set of FQNs that exist in this repo (local Java classes).
+  // Used to guard against intra-repo FQN references in resource files.
+  const localFqnSet = new Set<string>();
+  const javaFiles = await findJavaFiles(repoPath);
+  for (const relFile of javaFiles) {
+    const absPath = path.join(repoPath, relFile);
+    let content: string;
+    try {
+      content = await fs.readFile(absPath, 'utf-8');
+    } catch {
+      continue;
+    }
+    const pkgMatch = content.match(/^package\s+([\w.]+)\s*;/m);
+    if (!pkgMatch) continue;
+    const className = path.basename(relFile, path.extname(relFile));
+    if (/^[A-Z]/.test(className)) {
+      localFqnSet.add(`${pkgMatch[1]}.${className}`);
+    }
+  }
+
+  const resourceFiles = await findResourceFiles(repoPath);
+  // Generic FQN: at least 2 lowercase segments + PascalCase tail.
+  const fqnRegex = /\b([a-z][\w]*(?:\.[a-z][\w]*){1,}\.[A-Z]\w+)\b/g;
+  for (const relFile of resourceFiles) {
+    const absPath = path.join(repoPath, relFile);
+    let content: string;
+    try {
+      content = await fs.readFile(absPath, 'utf-8');
+    } catch {
+      continue;
+    }
+    const seenInFile = new Set<string>();
+    let m: RegExpExecArray | null;
+    while ((m = fqnRegex.exec(content)) !== null) {
+      const fqn = m[1];
+      if (seenInFile.has(fqn)) continue;
+      seenInFile.add(fqn);
+      const className = fqn.split('.').pop()!;
+      if (!/^[A-Z]\w*$/.test(className)) continue;
+      for (const [basePkg, claimants] of sortedPkgs) {
+        if (fqn.startsWith(basePkg + '.') || fqn === basePkg) {
+          // Skip if FQN matches a class in the scanned repo (intra-repo).
+          if (localFqnSet.has(fqn)) break;
+          for (const ak of claimants) {
+            results.push({
+              artifactKey: ak,
+              symbolName: className,
+              filePath: relFile,
+            });
+          }
+          break;
+        }
+      }
+    }
+  }
+  return results;
+}
+
 function isPascalCase(name: string): boolean {
   return /^[A-Z][A-Za-z0-9]*$/.test(name);
 }
@@ -920,6 +1038,30 @@ export async function extractJavaWorkspaceLinks(
         type: 'override',
         contract: qualifiedContract,
         extSymbol: ov.extSymbolName,
+        role: 'provider' as ContractRole,
+      });
+    }
+
+    // Scan XML/properties/TLD/DRL files for FQN references to known group
+    // packages. Resource files carry semantic references invisible to the
+    // .java-only scanners above. Generic — driven entirely by knownPackages.
+    const xmlRefs = await scanResourceFqnReferences(scanDir, knownPackages);
+    for (const ref of xmlRefs) {
+      const providerProj = projectsByKey.get(ref.artifactKey);
+      if (!providerProj) continue;
+      if (providerProj.groupPath === proj.groupPath) continue;
+
+      const qualifiedContract = `${providerProj.artifactId}::${ref.symbolName}`;
+      const dedupKey = `${proj.groupPath}→${providerProj.groupPath}::xml-ref::${qualifiedContract}::${ref.filePath}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+
+      links.push({
+        from: providerProj.groupPath,
+        to: proj.groupPath,
+        type: 'xml-ref',
+        contract: qualifiedContract,
+        consumerFilePath: ref.filePath,
         role: 'provider' as ContractRole,
       });
     }

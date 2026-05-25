@@ -8,7 +8,8 @@ export type ContractType =
   | 'include'
   | 'extends'
   | 'implements'
-  | 'override';
+  | 'override'
+  | 'xml-ref';
 export type MatchType = 'exact' | 'manifest' | 'wildcard' | 'bm25' | 'embedding';
 export type ContractRole = 'provider' | 'consumer';
 

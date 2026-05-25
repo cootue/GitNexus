@@ -38,7 +38,10 @@ export class ManifestExtractor {
       // Fix 14a: include extSymbol in cache key for extends/implements/override
       // links — multiple ext classes can implement the same base and each must
       // resolve to its own symbol node.
-      const key = `${repo}\u0000${link.type}\u0000${link.contract}\u0000${link.extSymbol || ''}`;
+      // Fix 15d: include consumerFilePath for xml-ref links so the same base
+      // type referenced from multiple XML files produces distinct consumer-side
+      // entries.
+      const key = `${repo}\u0000${link.type}\u0000${link.contract}\u0000${link.extSymbol || ''}\u0000${link.consumerFilePath || ''}`;
       let pending = resolveCache.get(key);
       if (!pending) {
         pending = this.resolveSymbol(repo, link, dbExecutors);
@@ -92,12 +95,19 @@ export class ManifestExtractor {
       // Fix 13/14b: For extends/implements/override links, the consumer
       // symbol name is the ext class (link.extSymbol), not the base class
       // (link.contract).
+      // Fix 15d: For xml-ref links the consumer is a resource file,
+      // not a graph symbol; use the file's basename as the symbol name.
       const consumerSymbolName =
         (link.type === 'extends' || link.type === 'implements' || link.type === 'override') &&
         link.extSymbol
           ? link.extSymbol
-          : link.contract;
-      const consumerRef = consumerSymbol || { filePath: '', name: consumerSymbolName };
+          : link.type === 'xml-ref' && link.consumerFilePath
+            ? link.consumerFilePath.split(/[\\/]/).pop()!
+            : link.contract;
+      const consumerRef = consumerSymbol || {
+        filePath: link.type === 'xml-ref' && link.consumerFilePath ? link.consumerFilePath : '',
+        name: consumerSymbolName,
+      };
       const providerUid = providerSymbol?.uid || manifestSymbolUid(providerRepo, contractId);
       const consumerUid = consumerSymbol?.uid || manifestSymbolUid(consumerRepo, contractId);
 
@@ -358,6 +368,31 @@ export class ManifestExtractor {
             { symbolName },
           );
         }
+      } else if (link.type === 'xml-ref') {
+        // Fix 15d: xml-ref consumer side is a resource file (not a graph
+        // symbol) — return null for consumer. Provider side resolves the
+        // Java class.
+        const isProvider = repoPathKey === link.from;
+        if (!isProvider) return null;
+        const symbolName = link.contract.includes('::')
+          ? link.contract.split('::').pop()!
+          : link.contract;
+        rows = await executor(
+          `MATCH (n:Class|Interface|Method|Function) WHERE n.name = $symbolName
+           RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+           ORDER BY n.filePath ASC
+           LIMIT 1`,
+          { symbolName },
+        );
+        if (rows.length === 0) {
+          rows = await executor(
+            `MATCH (n:Enum|Struct|Trait|Constructor|CodeElement) WHERE n.name = $symbolName
+             RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+             ORDER BY n.filePath ASC
+             LIMIT 1`,
+            { symbolName },
+          );
+        }
       } else {
         return null;
       }
@@ -401,6 +436,8 @@ export class ManifestExtractor {
         return `implements::${contract}`;
       case 'override':
         return `override::${contract}`;
+      case 'xml-ref':
+        return `xml-ref::${contract}`;
       case 'include':
         return `include::${contract}`;
       default: {
