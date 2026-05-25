@@ -596,10 +596,14 @@ export async function runGroupImpact(
         },
         remainingMs,
       );
-      if (neighborTimedOut || fan == null) {
+      if (neighborTimedOut) {
         truncatedRepos.push(n.neighborRepo);
         continue;
       }
+      // fan == null: the neighbor's local impact engine returned no result
+      // (e.g. the UID is a manifest:: synthetic that isn't in the graph).
+      // Still report the cross-link so downstream consumers can see the
+      // connection — just with empty by_depth and affected_processes.
 
       cross.push({
         repo: regName,
@@ -610,8 +614,11 @@ export async function runGroupImpact(
           match_type: (n.matchType as MatchType) || 'exact',
           confidence: n.confidence,
         },
-        by_depth: ((fan as { byDepth?: unknown }).byDepth ?? {}) as Record<string, unknown[]>,
-        affected_processes: extractProcessNames(fan),
+        by_depth: ((fan as { byDepth?: unknown } | null)?.byDepth ?? {}) as Record<
+          string,
+          unknown[]
+        >,
+        affected_processes: fan ? extractProcessNames(fan) : [],
       });
     }
   } finally {
