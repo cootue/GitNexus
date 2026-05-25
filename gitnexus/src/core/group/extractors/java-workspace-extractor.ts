@@ -45,10 +45,25 @@ interface PomResult {
 async function parseJavaManifest(
   repoPath: string,
 ): Promise<(PomResult & { pomPath: string }) | null> {
+  // Fix 19: Expand search to include Applications/*/pom.xml for repos
+  // without an aggregator POM in the root or Applications/ directly.
   const pomSearchPaths = [
     path.join(repoPath, 'pom.xml'),
     path.join(repoPath, 'Applications', 'pom.xml'),
   ];
+  // Add Applications/subdir/pom.xml for repos with multiple sub-apps
+  const appsDir = path.join(repoPath, 'Applications');
+  try {
+    const appEntries = await fs.readdir(appsDir, { withFileTypes: true });
+    for (const entry of appEntries) {
+      if (entry.isDirectory()) {
+        const subPom = path.join(appsDir, entry.name, 'pom.xml');
+        if (!pomSearchPaths.includes(subPom)) pomSearchPaths.push(subPom);
+      }
+    }
+  } catch {
+    // Applications/ subdir doesn't exist — skip
+  }
   for (const pomPath of pomSearchPaths) {
     try {
       const content = await fs.readFile(pomPath, 'utf-8');
@@ -827,6 +842,200 @@ async function findJavaFiles(repoPath: string): Promise<string[]> {
   return results;
 }
 
+// Fix 20: Order-independent Maven module discovery. Recursively walks
+// the repo to discover ALL pom.xml files (stop-recurse-on-pom),
+// classifies into aggregators vs leaves, BFS from aggregators (sorted
+// by module count — super-aggregators first), registers uncovered leaves,
+// and fixes the orphan bug (missing moduleDir). Returns false if no
+// Maven candidates found (caller falls back to parseJavaManifest for
+// Gradle repos).
+async function scanRepoMavenProjects(
+  repoPath: string,
+  groupPath: string,
+  projectsByKey: Map<string, JavaProjectMeta>,
+  moduleDirToKey: Map<string, string>,
+  projectsByGroupPath: Map<string, JavaProjectMeta>,
+): Promise<boolean> {
+  interface PomCandidate extends PomResult {
+    pomDir: string;
+  }
+
+  const candidates: PomCandidate[] = [];
+  const skipDirNames = new Set(['node_modules', 'target']);
+  const skipDirPrefixes = ['.'];
+
+  async function findPomFiles(dir: string, depth: number): Promise<void> {
+    if (depth > 10) return;
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const name = entry.name;
+      if (skipDirPrefixes.some((p) => name.startsWith(p)) || skipDirNames.has(name)) continue;
+      if (!entry.isDirectory()) continue;
+      const childDir = path.join(dir, name);
+      const childPom = path.join(childDir, 'pom.xml');
+      let pomContent: string | undefined;
+      try {
+        pomContent = await fs.readFile(childPom, 'utf-8');
+      } catch {
+        /* no pom.xml */
+      }
+      if (pomContent) {
+        const result = parsePom(pomContent);
+        if (result) {
+          candidates.push({ ...result, pomDir: childDir });
+        }
+        continue; // stop-recurse-on-pom
+      }
+      await findPomFiles(childDir, depth + 1);
+    }
+  }
+
+  let rootResult: PomResult | null = null;
+  try {
+    const rootContent = await fs.readFile(path.join(repoPath, 'pom.xml'), 'utf-8');
+    rootResult = parsePom(rootContent);
+  } catch {
+    /* no root pom.xml */
+  }
+  if (rootResult) {
+    candidates.unshift({ ...rootResult, pomDir: repoPath });
+  }
+  await findPomFiles(repoPath, 0);
+  if (candidates.length === 0) return false;
+
+  const aggregators = candidates.filter((c) => c.modules.length > 0);
+  const leaves = candidates.filter((c) => c.modules.length === 0);
+  aggregators.sort((a, b) => b.modules.length - a.modules.length);
+
+  const manifest = aggregators[0] || leaves[0];
+  const manifestKey = `${manifest.groupId}:${manifest.artifactId}`;
+  const existing = projectsByKey.get(manifestKey);
+  if (existing) {
+    logger.warn(
+      `[java-workspace-extractor] duplicate artifact "${manifestKey}" in "${groupPath}" and "${existing.groupPath}" — skipping "${groupPath}"`,
+    );
+    return true;
+  }
+  const meta: JavaProjectMeta = {
+    groupId: manifest.groupId,
+    artifactId: manifest.artifactId,
+    groupPath,
+    repoPath,
+    deps: manifest.deps,
+  };
+  projectsByKey.set(manifestKey, meta);
+  projectsByGroupPath.set(groupPath, meta);
+  logger.info(
+    `[java-workspace-extractor] manifest: ${manifestKey} in ${groupPath} (${aggregators.length} aggregators, ${leaves.length} leaves, ${candidates.length} total candidates)`,
+  );
+
+  const visited = new Set<string>();
+  for (const agg of aggregators) {
+    const aggKey = `${agg.groupId}:${agg.artifactId}`;
+    if (aggKey !== manifestKey) {
+      if (!projectsByKey.has(aggKey)) {
+        const aggMeta: JavaProjectMeta = {
+          groupId: agg.groupId,
+          artifactId: agg.artifactId,
+          groupPath,
+          repoPath,
+          moduleDir: agg.pomDir,
+          deps: agg.deps,
+        };
+        projectsByKey.set(aggKey, aggMeta);
+        moduleDirToKey.set(agg.pomDir, aggKey);
+        logger.info(
+          `[java-workspace-extractor] aggregator: ${aggKey} in ${groupPath} (${agg.modules.length} modules)`,
+        );
+      } else if (!projectsByKey.get(aggKey)!.moduleDir) {
+        projectsByKey.get(aggKey)!.moduleDir = agg.pomDir;
+        moduleDirToKey.set(agg.pomDir, aggKey);
+      }
+    }
+    let currentLevel: Array<{
+      pomDir: string;
+      parentGroupId: string;
+      pomResult: PomResult;
+    }> = [{ pomDir: agg.pomDir, parentGroupId: agg.groupId, pomResult: agg }];
+    for (let depth = 0; depth < 5 && currentLevel.length > 0; depth++) {
+      const nextLevel: typeof currentLevel = [];
+      for (const { pomDir, parentGroupId, pomResult } of currentLevel) {
+        if (!pomResult.modules || pomResult.modules.length === 0) continue;
+        for (const moduleName of pomResult.modules) {
+          const moduleDir = path.join(pomDir, moduleName);
+          const normDir = moduleDir.split(path.sep).join(path.sep);
+          if (visited.has(normDir)) continue;
+          visited.add(normDir);
+          const modulePomPath = path.join(moduleDir, 'pom.xml');
+          let moduleContent: string;
+          try {
+            moduleContent = await fs.readFile(modulePomPath, 'utf-8');
+          } catch {
+            continue;
+          }
+          const moduleResult = parsePom(moduleContent);
+          if (!moduleResult) continue;
+          const moduleGroupId = moduleResult.groupId || parentGroupId;
+          const moduleKey = `${moduleGroupId}:${moduleResult.artifactId}`;
+          if (!projectsByKey.has(moduleKey)) {
+            const moduleMeta: JavaProjectMeta = {
+              groupId: moduleGroupId,
+              artifactId: moduleResult.artifactId,
+              groupPath,
+              repoPath,
+              moduleDir,
+              deps: moduleResult.deps,
+            };
+            projectsByKey.set(moduleKey, moduleMeta);
+            moduleDirToKey.set(moduleDir, moduleKey);
+            logger.info(
+              `[java-workspace-extractor] module: ${moduleKey} in ${groupPath} (depth ${depth + 1})`,
+            );
+          } else if (!projectsByKey.get(moduleKey)!.moduleDir) {
+            projectsByKey.get(moduleKey)!.moduleDir = moduleDir;
+            moduleDirToKey.set(moduleDir, moduleKey);
+          }
+          nextLevel.push({
+            pomDir: moduleDir,
+            parentGroupId: moduleGroupId,
+            pomResult: moduleResult,
+          });
+        }
+      }
+      currentLevel = nextLevel;
+    }
+  }
+
+  // Register uncovered leaves that weren't reached via BFS from aggregators.
+  for (const leaf of leaves) {
+    const leafKey = `${leaf.groupId}:${leaf.artifactId}`;
+    if (leafKey === manifestKey) continue;
+    if (!projectsByKey.has(leafKey)) {
+      const leafMeta: JavaProjectMeta = {
+        groupId: leaf.groupId,
+        artifactId: leaf.artifactId,
+        groupPath,
+        repoPath,
+        moduleDir: leaf.pomDir,
+        deps: leaf.deps,
+      };
+      projectsByKey.set(leafKey, leafMeta);
+      moduleDirToKey.set(leaf.pomDir, leafKey);
+      logger.info(`[java-workspace-extractor] leaf: ${leafKey} in ${groupPath}`);
+    } else if (!projectsByKey.get(leafKey)!.moduleDir) {
+      projectsByKey.get(leafKey)!.moduleDir = leaf.pomDir;
+      moduleDirToKey.set(leaf.pomDir, leafKey);
+    }
+  }
+
+  return true;
+}
+
 export interface JavaWorkspaceResult {
   links: GroupManifestLink[];
   discoveredProjects: Map<string, JavaProjectMeta>;
@@ -845,80 +1054,92 @@ export async function extractJavaWorkspaceLinks(
     const repoPath = repoPaths.get(groupPath);
     if (!repoPath) continue;
 
-    const manifest = await parseJavaManifest(repoPath);
-    if (!manifest) continue;
-
-    const key = `${manifest.groupId}:${manifest.artifactId}`;
-    const meta: JavaProjectMeta = {
-      groupId: manifest.groupId,
-      artifactId: manifest.artifactId,
-      groupPath,
+    // Fix 20: Order-independent Maven module discovery replaces
+    // parseJavaManifest + old BFS block. Falls back to parseJavaManifest
+    // for Gradle-only repos.
+    const mavenFound = await scanRepoMavenProjects(
       repoPath,
-      deps: manifest.deps,
-    };
-    const existing = projectsByKey.get(key);
-    if (existing) {
-      logger.warn(
-        `[java-workspace-extractor] duplicate artifact "${key}" in "${groupPath}" and "${existing.groupPath}" — skipping "${groupPath}"`,
-      );
-      continue;
-    }
-    projectsByKey.set(key, meta);
-    projectsByGroupPath.set(groupPath, meta);
+      groupPath,
+      projectsByKey,
+      moduleDirToKey,
+      projectsByGroupPath,
+    );
+    if (!mavenFound) {
+      const manifest = await parseJavaManifest(repoPath);
+      if (!manifest) continue;
 
-    // Multi-module Maven: BFS from <modules> list up to 5 levels deep.
-    if (manifest.modules && manifest.modules.length > 0 && manifest.pomPath) {
-      let currentLevel: Array<{
-        pomDir: string;
-        parentGroupId: string;
-        pomResult: PomResult;
-      }> = [
-        {
-          pomDir: path.dirname(manifest.pomPath),
-          parentGroupId: manifest.groupId,
-          pomResult: manifest,
-        },
-      ];
-      for (let depth = 0; depth < 5 && currentLevel.length > 0; depth++) {
-        const nextLevel: typeof currentLevel = [];
-        for (const { pomDir, parentGroupId, pomResult } of currentLevel) {
-          if (!pomResult.modules || pomResult.modules.length === 0) continue;
-          for (const moduleName of pomResult.modules) {
-            const moduleDir = path.join(pomDir, moduleName);
-            const modulePomPath = path.join(moduleDir, 'pom.xml');
-            try {
-              const moduleContent = await fs.readFile(modulePomPath, 'utf-8');
-              const moduleResult = parsePom(moduleContent);
-              if (moduleResult) {
-                const moduleGroupId = moduleResult.groupId || parentGroupId;
-                const moduleKey = `${moduleGroupId}:${moduleResult.artifactId}`;
-                if (!projectsByKey.has(moduleKey)) {
-                  const moduleMeta: JavaProjectMeta = {
-                    groupId: moduleGroupId,
-                    artifactId: moduleResult.artifactId,
-                    groupPath,
-                    repoPath,
-                    moduleDir,
-                    deps: moduleResult.deps,
-                  };
-                  projectsByKey.set(moduleKey, moduleMeta);
-                  moduleDirToKey.set(moduleDir, moduleKey);
-                  logger.info(
-                    `[java-workspace-extractor] discovered module ${moduleKey} in ${groupPath} (depth ${depth + 1})`,
-                  );
-                  nextLevel.push({
-                    pomDir: moduleDir,
-                    parentGroupId: moduleGroupId,
-                    pomResult: moduleResult,
-                  });
+      const key = `${manifest.groupId}:${manifest.artifactId}`;
+      const meta: JavaProjectMeta = {
+        groupId: manifest.groupId,
+        artifactId: manifest.artifactId,
+        groupPath,
+        repoPath,
+        deps: manifest.deps,
+      };
+      const existing = projectsByKey.get(key);
+      if (existing) {
+        logger.warn(
+          `[java-workspace-extractor] duplicate artifact "${key}" in "${groupPath}" and "${existing.groupPath}" — skipping "${groupPath}"`,
+        );
+        continue;
+      }
+      projectsByKey.set(key, meta);
+      projectsByGroupPath.set(groupPath, meta);
+
+      // Multi-module Maven from parseJavaManifest (Gradle fallback path)
+      if (manifest.modules && manifest.modules.length > 0 && manifest.pomPath) {
+        let currentLevel: Array<{
+          pomDir: string;
+          parentGroupId: string;
+          pomResult: PomResult;
+        }> = [
+          {
+            pomDir: path.dirname(manifest.pomPath),
+            parentGroupId: manifest.groupId,
+            pomResult: manifest,
+          },
+        ];
+        for (let depth = 0; depth < 5 && currentLevel.length > 0; depth++) {
+          const nextLevel: typeof currentLevel = [];
+          for (const { pomDir, parentGroupId, pomResult } of currentLevel) {
+            if (!pomResult.modules || pomResult.modules.length === 0) continue;
+            for (const moduleName of pomResult.modules) {
+              const moduleDir = path.join(pomDir, moduleName);
+              const modulePomPath = path.join(moduleDir, 'pom.xml');
+              try {
+                const moduleContent = await fs.readFile(modulePomPath, 'utf-8');
+                const moduleResult = parsePom(moduleContent);
+                if (moduleResult) {
+                  const moduleGroupId = moduleResult.groupId || parentGroupId;
+                  const moduleKey = `${moduleGroupId}:${moduleResult.artifactId}`;
+                  if (!projectsByKey.has(moduleKey)) {
+                    const moduleMeta: JavaProjectMeta = {
+                      groupId: moduleGroupId,
+                      artifactId: moduleResult.artifactId,
+                      groupPath,
+                      repoPath,
+                      moduleDir,
+                      deps: moduleResult.deps,
+                    };
+                    projectsByKey.set(moduleKey, moduleMeta);
+                    moduleDirToKey.set(moduleDir, moduleKey);
+                    logger.info(
+                      `[java-workspace-extractor] discovered module ${moduleKey} in ${groupPath} (depth ${depth + 1})`,
+                    );
+                    nextLevel.push({
+                      pomDir: moduleDir,
+                      parentGroupId: moduleGroupId,
+                      pomResult: moduleResult,
+                    });
+                  }
                 }
+              } catch {
+                // Module POM not found or unreadable — skip
               }
-            } catch {
-              // Module POM not found or unreadable — skip
             }
           }
+          currentLevel = nextLevel;
         }
-        currentLevel = nextLevel;
       }
     }
   }
