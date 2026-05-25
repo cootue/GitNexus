@@ -31,7 +31,7 @@ const bridgeLogger = createLogger('bridge-db', { debugEnvVar: 'GITNEXUS_DEBUG_BR
  * it into place. The rename only moves the main file; sidecars must be
  * cleaned up explicitly or the next writer trips the database-id check.
  */
-const LBUG_SIDECAR_SUFFIXES = ['.wal', '.shadow'] as const;
+const LBUG_SIDECAR_SUFFIXES = ['.wal', '.shadow', '.wal.checkpoint'] as const;
 
 async function removeLbugFile(basePath: string): Promise<void> {
   const candidates = [basePath, ...LBUG_SIDECAR_SUFFIXES.map((s) => `${basePath}${s}`)];
@@ -609,6 +609,22 @@ export async function writeBridge(
     }
     await removeLbugFile(bakPath);
 
+    // 4. Remove sidecar files left by LadybugDB's background checkpoint
+    //    thread. After CHECKPOINT + close the main database file is the
+    //    authoritative source — sidecars are safely deletable.
+    //    On Windows, LadybugDB's non-blocking checkpoint thread can outlive
+    //    the close call and leave .wal / .wal.checkpoint / .shadow files;
+    //    these stale sidecars would cause "Couldn't replay shadow pages" or
+    //    database-id mismatch on the next read-side open.
+    for (const suffix of LBUG_SIDECAR_SUFFIXES) {
+      const sidecarPath = `${finalPath}${suffix}`;
+      try {
+        await fsp.unlink(sidecarPath);
+      } catch {
+        /* already absent */
+      }
+    }
+
     // 4. Write meta.json
     await writeBridgeMeta(groupDir, {
       version: BRIDGE_SCHEMA_VERSION,
@@ -693,6 +709,23 @@ async function ensureBridgeDbFileAvailable(groupDir: string): Promise<boolean> {
 export async function openBridgeDbReadOnly(groupDir: string): Promise<BridgeHandle | null> {
   const dbPath = path.join(groupDir, 'bridge.lbug');
   if (!(await ensureBridgeDbFileAvailable(groupDir))) return null;
+
+  // Windows fix: LadybugDB .wal/.shadow sidecars from a previous writer
+  // can be orphaned after an interrupted writeBridge or if the background
+  // checkpoint thread outlived the Database.close() call. Delete stale
+  // sidecars before attempting to open — the main bridge.lbug file is the
+  // authoritative source (writeBridge atomically swaps main + sidecars,
+  // so stale sidecars belong to an old generation).
+  if (process.platform === 'win32') {
+    for (const suffix of LBUG_SIDECAR_SUFFIXES) {
+      const sidecarPath = `${dbPath}${suffix}`;
+      try {
+        await fsp.unlink(sidecarPath);
+      } catch {
+        /* already absent */
+      }
+    }
+  }
 
   // Version gate: check meta.json version compatibility
   const meta = await readBridgeMeta(groupDir);
