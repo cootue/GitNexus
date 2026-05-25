@@ -2,19 +2,12 @@ import type { ContractType, CrossLink, GroupManifestLink, StoredContract } from 
 import type { CypherExecutor } from '../contract-extractor.js';
 
 import { logger } from '../../logger.js';
+
 export interface ManifestExtractResult {
   contracts: StoredContract[];
   crossLinks: CrossLink[];
 }
 
-/**
- * Canonicalize an HTTP path for matching against Route.name in the graph.
- * Mirrors core/ingestion/pipeline.ts ensureSlash semantics:
- * - Ensures a leading slash.
- * - Strips trailing slashes (except the root "/").
- * - Normalizes consecutive slashes.
- * - Does NOT lowercase (route matching is case-sensitive).
- */
 function normalizeRoutePath(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '/';
@@ -24,53 +17,12 @@ function normalizeRoutePath(raw: string): string {
   return collapsed.replace(/\/+$/, '');
 }
 
-/**
- * Split a manifest HTTP contract into its optional `METHOD::` prefix and
- * its path portion.
- *
- * `buildContractId` recommends the explicit-method form `GET::/api/orders`
- * in group.yaml; if we hand that raw string to `normalizeRoutePath` we get
- * `/GET::/api/orders`, which can never match `Route.name = "/api/orders"`
- * in the graph. This helper extracts the path portion so the Cypher
- * lookup uses the canonical route name.
- *
- * The method prefix regex mirrors `buildContractId` (line ~251) for
- * symmetry: case-insensitive `[A-Za-z]+` followed by `::`. The captured
- * method is upper-cased for downstream use; method-constrained matching
- * against `HANDLES_ROUTE` is a future enhancement (not yet wired).
- *
- * Edge cases:
- *  - `"::/api/orders"` — empty method portion, no alpha prefix match, so
- *    the whole string is treated as a bare path (matches buildContractId
- *    which also requires `[A-Za-z]+`).
- *  - `"GET::"` — method with empty path, returns `{ method: 'GET', path: '' }`;
- *    `normalizeRoutePath('')` resolves to `/` for caller.
- */
 function parseHttpContract(raw: string): { method: string | null; path: string } {
   const match = raw.match(/^([A-Za-z]+)::/);
   if (!match) return { method: null, path: raw };
   return { method: match[1].toUpperCase(), path: raw.slice(match[0].length) };
 }
 
-/**
- * Stable synthetic symbolUid for a manifest-declared contract whose target
- * symbol could not be resolved against the per-repo graph (resolveSymbol
- * returned null). Two reasons we don't leave the uid empty:
- *
- *  1. The bridge stores Contract nodes keyed in part by symbolUid; an empty
- *     uid means downstream Cypher queries that anchor on `provider.symbolUid`
- *     can't tell two different unresolved manifest contracts apart.
- *  2. The cross-impact bridge query in cross-impact.ts joins local impact
- *     results to bridge contracts via `WHERE provider.symbolUid IN $localUids`.
- *     If the local impact engine produces a deterministic identifier for the
- *     unresolved target, it must agree with the value the bridge stored. A
- *     synthetic uid keyed off (repo, contractId) is the only thing both sides
- *     can derive without knowing about each other.
- *
- * Format: `manifest::<repo>::<contractId>`. Stable across syncs, scoped to a
- * single repo within a group, and never collides with real indexer uids
- * (which never start with `manifest::`).
- */
 export function manifestSymbolUid(repo: string, contractId: string): string {
   return `manifest::${repo}::${contractId}`;
 }
@@ -80,14 +32,6 @@ export class ManifestExtractor {
     links: GroupManifestLink[],
     dbExecutors?: Map<string, CypherExecutor>,
   ): Promise<ManifestExtractResult> {
-    // Resolve all (repo, link) pairs in parallel. The previous sequential
-    // await-per-link produced 2N round-trips; parallel resolution uses the
-    // per-repo executor pool directly and scales linearly with manifest size.
-    //
-    // Memoization: a manifest can list the same contract multiple times
-    // (e.g. a consumer and provider declaration, or cross-referenced groups).
-    // Key on (repo, type, contract) — the canonical input to the Cypher
-    // query — so duplicate links resolve to one DB hit.
     type ResolvedSymbol = { filePath: string; name: string; uid: string } | null;
     const resolveCache = new Map<string, Promise<ResolvedSymbol>>();
     const resolveOnce = (repo: string, link: GroupManifestLink): Promise<ResolvedSymbol> => {
@@ -100,21 +44,38 @@ export class ManifestExtractor {
       return pending;
     };
 
-    const perLink = await Promise.all(
-      links.map(async (link) => {
-        const contractId = this.buildContractId(link.type, link.contract);
-        const providerRepo = link.role === 'provider' ? link.from : link.to;
-        const consumerRepo = link.role === 'provider' ? link.to : link.from;
-        const [providerSymbol, consumerSymbol] = await Promise.all([
-          resolveOnce(providerRepo, link),
-          resolveOnce(consumerRepo, link),
-        ]);
-        return { link, contractId, providerRepo, consumerRepo, providerSymbol, consumerSymbol };
-      }),
-    );
+    // Batch processing instead of Promise.all — each link makes up to 2
+    // concurrent resolveSymbol calls; firing all at once overwhelms the
+    // DB pool on large manifests.
+    const BATCH_SIZE = 8;
+    const perLink: Array<{
+      link: GroupManifestLink;
+      contractId: string;
+      providerRepo: string;
+      consumerRepo: string;
+      providerSymbol: ResolvedSymbol;
+      consumerSymbol: ResolvedSymbol;
+    }> = [];
+    for (let i = 0; i < links.length; i += BATCH_SIZE) {
+      const batch = links.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(
+        batch.map(async (link) => {
+          const contractId = this.buildContractId(link.type, link.contract);
+          const providerRepo = link.role === 'provider' ? link.from : link.to;
+          const consumerRepo = link.role === 'provider' ? link.to : link.from;
+          const [providerSymbol, consumerSymbol] = await Promise.all([
+            resolveOnce(providerRepo, link),
+            resolveOnce(consumerRepo, link),
+          ]);
+          return { link, contractId, providerRepo, consumerRepo, providerSymbol, consumerSymbol };
+        }),
+      );
+      perLink.push(...batchResults);
+    }
 
-    const contracts: StoredContract[] = [];
-    const crossLinks: CrossLink[] = [];
+    // Use candidate naming — dedup may remove some entries.
+    const contractCandidates: StoredContract[] = [];
+    const crossLinkCandidates: Array<CrossLink & { _providerFilePath: string }> = [];
 
     for (const {
       link,
@@ -126,12 +87,10 @@ export class ManifestExtractor {
     } of perLink) {
       const providerRef = providerSymbol || { filePath: '', name: link.contract };
       const consumerRef = consumerSymbol || { filePath: '', name: link.contract };
-      // When the resolver finds a real graph symbol we keep its uid, otherwise
-      // fall back to the deterministic synthetic uid (see manifestSymbolUid).
       const providerUid = providerSymbol?.uid || manifestSymbolUid(providerRepo, contractId);
       const consumerUid = consumerSymbol?.uid || manifestSymbolUid(consumerRepo, contractId);
 
-      contracts.push({
+      contractCandidates.push({
         contractId,
         type: link.type,
         role: 'provider',
@@ -143,7 +102,7 @@ export class ManifestExtractor {
         repo: providerRepo,
       });
 
-      contracts.push({
+      contractCandidates.push({
         contractId,
         type: link.type,
         role: 'consumer',
@@ -155,14 +114,105 @@ export class ManifestExtractor {
         repo: consumerRepo,
       });
 
-      crossLinks.push({
+      crossLinkCandidates.push({
         from: { repo: consumerRepo, symbolUid: consumerUid, symbolRef: consumerRef },
-        to: { repo: providerRepo, symbolUid: providerUid, symbolRef: providerRef },
+        to: {
+          repo: providerRepo,
+          symbolUid: providerUid,
+          symbolRef: providerRef,
+        },
         type: link.type,
         contractId,
         matchType: 'manifest',
         confidence: 1.0,
+        _providerFilePath: providerRef.filePath,
       });
+    }
+
+    // Dedup over-approximate contracts and cross-links.
+    // When multiple claimants map to the same package prefix, the same
+    // symbol can produce contracts with different contractIds (e.g.
+    // "mathlex::Expression" vs "calculator::Expression" for the same
+    // graph node). Group provider contracts by (repo, type, symbolUid,
+    // filePath) and keep the best contractId match. Then filter all
+    // contracts by the surviving contractIds and dedup cross-links.
+    function bestMatchScore(contractId: string, filePath: string): number {
+      if (!filePath || filePath === '') return 0;
+      // Prefer contractIds that contain the file's directory structure.
+      const dirParts = filePath.split('/').slice(0, -1);
+      let score = 0;
+      for (const part of dirParts) {
+        if (contractId.includes(part)) score++;
+      }
+      return score;
+    }
+
+    // Group provider contracts by (repo, type, symbolUid, filePath)
+    const providerGroups = new Map<string, StoredContract[]>();
+    for (const c of contractCandidates) {
+      if (c.role !== 'provider') continue;
+      const gk = `${c.repo}\0${c.type}\0${c.symbolUid}\0${c.symbolRef.filePath}`;
+      const existing = providerGroups.get(gk);
+      if (existing) existing.push(c);
+      else providerGroups.set(gk, [c]);
+    }
+
+    const bestContractIds = new Set<string>();
+    for (const [, group] of providerGroups) {
+      if (group.length === 1) {
+        bestContractIds.add(group[0].contractId);
+        continue;
+      }
+      // Keep the contract with the best match score.
+      let bestIdx = 0;
+      let bestScore = bestMatchScore(group[0].contractId, group[0].symbolRef.filePath);
+      for (let i = 1; i < group.length; i++) {
+        const s = bestMatchScore(group[i].contractId, group[i].symbolRef.filePath);
+        if (s > bestScore) {
+          bestScore = s;
+          bestIdx = i;
+        }
+      }
+      bestContractIds.add(group[bestIdx].contractId);
+    }
+
+    // Also keep all consumer contracts (they don't have the over-approximation
+    // issue — each consumer is unique per repo).
+    for (const c of contractCandidates) {
+      if (c.role === 'consumer') bestContractIds.add(c.contractId);
+    }
+
+    const contracts = contractCandidates.filter((c) => bestContractIds.has(c.contractId));
+
+    // Dedup cross-links by (type, fromRepo, toRepo, providerFilePath, symbolName)
+    // — keep the best match.
+    const clGroups = new Map<string, typeof crossLinkCandidates>();
+    for (const cl of crossLinkCandidates) {
+      const gk = `${cl.type}\0${cl.from.repo}\0${cl.to.repo}\0${cl._providerFilePath}\0${cl.to.symbolRef.name}`;
+      const existing = clGroups.get(gk);
+      if (existing) existing.push(cl);
+      else clGroups.set(gk, [cl]);
+    }
+
+    const crossLinks: CrossLink[] = [];
+    for (const [, group] of clGroups) {
+      if (group.length === 1) {
+        // Strip internal _providerFilePath before returning.
+        const { _providerFilePath: _, ...cl } = group[0];
+        crossLinks.push(cl);
+        continue;
+      }
+      let bestIdx = 0;
+      let bestScore = bestMatchScore(group[0].contractId, group[0]._providerFilePath);
+      for (let i = 1; i < group.length; i++) {
+        const s = bestMatchScore(group[i].contractId, group[i]._providerFilePath);
+        if (s > bestScore) {
+          bestScore = s;
+          bestIdx = i;
+        }
+      }
+      const { _providerFilePath: _, ...cl } = group[bestIdx];
+      crossLinks.push(cl);
     }
 
     return { contracts, crossLinks };
@@ -176,33 +226,9 @@ export class ManifestExtractor {
     const executor = dbExecutors?.get(repoPathKey);
     if (!executor) return null;
 
-    // NOTE: All lookups use EXACT equality on the relevant name field and
-    // deterministic ORDER BY before LIMIT 1. Previous versions used CONTAINS
-    // for fuzzy matching (plus an unconditional IDL file fallback for gRPC)
-    // which produced silent false positives: e.g. manifest "/orders" would
-    // match "/suborders", and a gRPC manifest entry in a repo with any
-    // .proto file would attach to a random proto symbol.
-    //
-    // If resolveSymbol returns null, the extractor falls back to a
-    // deterministic synthetic uid via `manifestSymbolUid(repo, contractId)`
-    // (see the function's docstring for why synthetic rather than empty).
-    // Cross-impact still works: the bridge query joins on the synthetic
-    // uid, and the local impact engine derives the same uid for the
-    // unresolved symbol — name-based hints are the additional safety net.
     try {
       let rows: Record<string, unknown>[];
       if (link.type === 'http') {
-        // Route.name is the canonicalized URL path (see
-        // core/ingestion/pipeline.ts ensureSlash + generateId('Route', ...)).
-        // Normalize the manifest contract the same way so a user-written
-        // "/api/orders" matches "api/orders" in the graph.
-        //
-        // The contract may also use the explicit-method form "GET::/api/orders"
-        // recommended by buildContractId. Strip the METHOD:: prefix before
-        // normalizing — otherwise `normalizeRoutePath('GET::/api/orders')`
-        // returns `/GET::/api/orders` and never matches Route.name. The
-        // captured method is not yet used to constrain the Cypher query
-        // (method-aware HANDLES_ROUTE matching is a future enhancement).
         const parsed = parseHttpContract(link.contract);
         const normalized = normalizeRoutePath(parsed.path);
         rows = await executor(
@@ -214,11 +240,6 @@ export class ManifestExtractor {
           { normalized },
         );
       } else if (link.type === 'topic') {
-        // Topic names aren't a first-class NodeLabel in the graph —
-        // topics are referenced by function/method symbols (Kafka
-        // listeners, publishers). Restrict to symbol-like labels to
-        // avoid cross-matching Files/Variables/Imports that happen to
-        // share the topic name.
         rows = await executor(
           `MATCH (n:Function|Method|Class|Interface) WHERE n.name = $contract
            RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
@@ -227,16 +248,6 @@ export class ManifestExtractor {
           { contract: link.contract },
         );
       } else if (link.type === 'grpc' || link.type === 'thrift') {
-        // Contract is "Service/Method" or just "Service" (or package.Service
-        // variants). Prefer matching by method name when present, otherwise
-        // by service name. Thrift generated Java classes often use
-        // package.Service in manifests while graph Class/Interface names are
-        // stored as bare Service, so strip the package prefix for thrift
-        // service-name lookups. NO IDL path fallback — that's guaranteed to
-        // return a wrong symbol in any repo with more than one IDL file.
-        // Label filters scope lookups: methods → Function|Method, services
-        // → Class|Interface (no label match = no silent wrong hits on
-        // File/Variable nodes that happen to share the name).
         const parts = link.contract.split('/');
         const rawServiceName = parts[0]?.trim() ?? '';
         const serviceName =
@@ -262,13 +273,10 @@ export class ManifestExtractor {
           rows = [];
         }
       } else if (link.type === 'lib') {
-        // Only exact match on the symbol's name. Previous fallback to
-        // CONTAINS on n.filePath would promote "react" to "react-native"
-        // or "@types/react" — silent wrong attribution. Restrict to
-        // package-level labels so we don't return arbitrary symbols
-        // named after a library.
+        // Package label doesn't exist in LadybugDB for Java repos — use
+        // Module|Folder instead, which typically matches Maven module directories.
         rows = await executor(
-          `MATCH (n:Package|Module) WHERE n.name = $contract
+          `MATCH (n:Module|Folder) WHERE n.name = $contract
            RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
            ORDER BY n.filePath ASC
            LIMIT 1`,
@@ -283,20 +291,29 @@ export class ManifestExtractor {
           { contract: link.contract },
         );
       } else if (link.type === 'custom') {
-        // Workspace extractors produce qualified contracts like "mathlex::Expression".
-        // Graph nodes store the unqualified symbol name ("Expression"), so strip
-        // the "provider::" prefix before querying.
+        // Split 20-label Cypher into two fallback queries. The original
+        // single MATCH with all 20 labels can cause LadybugDB query planner
+        // issues on large graphs. Primary covers the most common Java types;
+        // fallback catches the rest.
         const symbolName = link.contract.includes('::')
           ? link.contract.split('::').pop()!
           : link.contract;
         rows = await executor(
-          `MATCH (n:Function|Method|Class|Interface|Struct|Enum|Trait|Constructor|TypeAlias|Impl|Macro|Union|Typedef|Property|Record|Delegate|Annotation|Template|Const|Static|CodeElement)
-           WHERE n.name = $symbolName
+          `MATCH (n:Class|Interface|Method|Function) WHERE n.name = $symbolName
            RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
            ORDER BY n.filePath ASC
            LIMIT 1`,
           { symbolName },
         );
+        if (rows.length === 0) {
+          rows = await executor(
+            `MATCH (n:Enum|Struct|Trait|Constructor|CodeElement) WHERE n.name = $symbolName
+             RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+             ORDER BY n.filePath ASC
+             LIMIT 1`,
+            { symbolName },
+          );
+        }
       } else {
         return null;
       }
@@ -308,9 +325,6 @@ export class ManifestExtractor {
         };
       }
     } catch (err) {
-      // Log but don't throw: a broken graph query in one repo shouldn't
-      // fail the whole manifest extraction. Unresolved contracts still
-      // get a synthetic symbolUid below, so cross-impact can proceed.
       const message = err instanceof Error ? err.message : String(err);
       logger.warn(
         `[manifest-extractor] resolveSymbol failed for ${link.type}:${link.contract} ` +
@@ -320,38 +334,9 @@ export class ManifestExtractor {
     return null;
   }
 
-  /**
-   * Build a canonical contract id for a manifest link.
-   *
-   * HTTP is the only type with two valid forms:
-   *   - Explicit method: `"GET::/api/orders"` → `"http::GET::/api/orders"`
-   *     (matches exactly against `HttpRouteExtractor` provider/consumer
-   *     contracts, which are also keyed by `http::<METHOD>::<path>`).
-   *   - Method-agnostic: `"/api/orders"` → `"http::*::/api/orders"`
-   *     — the `*` is a wildcard and is intended to match any concrete
-   *     HTTP method on that path. Wildcard-aware matching is the
-   *     responsibility of the sync / cross-impact layer (see #793);
-   *     downstream code should treat `http::*::<path>` as matching
-   *     every `http::<METHOD>::<path>` for the same path.
-   *
-   * Recommend the explicit-method form in group.yaml whenever the
-   * manifest author knows the method — it round-trips through exact
-   * equality matching without requiring wildcard logic downstream.
-   *
-   * NOTE on exhaustiveness: the switch covers every current
-   * `ContractType` variant and falls through to a `never` assertion so
-   * TypeScript fails the build if a new variant is added without a
-   * corresponding case.
-   */
   private buildContractId(type: ContractType, contract: string): string {
     switch (type) {
       case 'http': {
-        // Canonicalize method casing and path separators so logically
-        // equivalent inputs (`get::/api/orders` vs `GET::/api/orders`,
-        // or trailing-slash variants) produce the same contractId and
-        // matching `manifestSymbolUid` fallback. Without this, raw
-        // user casing leaks into cross-impact join keys and fragments
-        // matches across repos.
         const { method, path: rawPath } = parseHttpContract(contract);
         const normalizedPath = normalizeRoutePath(rawPath);
         return method ? `http::${method}::${normalizedPath}` : `http::*::${normalizedPath}`;
