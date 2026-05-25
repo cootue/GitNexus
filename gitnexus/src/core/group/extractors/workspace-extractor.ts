@@ -1,5 +1,5 @@
 import type { CypherExecutor } from '../contract-extractor.js';
-import type { GroupManifestLink } from '../types.js';
+import type { GroupManifestLink, MatchingConfig } from '../types.js';
 import { extractRustWorkspaceLinks } from './rust-workspace-extractor.js';
 import { extractNodeWorkspaceLinks } from './node-workspace-extractor.js';
 import { extractPythonWorkspaceLinks } from './python-workspace-extractor.js';
@@ -22,6 +22,7 @@ export async function discoverWorkspaceLinks(
   repos: Record<string, string>,
   repoPaths: Map<string, string>,
   dbExecutors?: Map<string, CypherExecutor>,
+  matchingConfig?: MatchingConfig,
 ): Promise<WorkspaceDiscoveryResult> {
   const links: GroupManifestLink[] = [];
   const stats: WorkspaceExtractorStats[] = [];
@@ -66,7 +67,7 @@ export async function discoverWorkspaceLinks(
     });
   }
 
-  const javaResult = await extractJavaWorkspaceLinks(repos, repoPaths, dbExecutors);
+  const javaResult = await extractJavaWorkspaceLinks(repos, repoPaths, dbExecutors, matchingConfig);
   if (javaResult.links.length > 0) {
     links.push(...javaResult.links);
     stats.push({

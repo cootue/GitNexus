@@ -263,7 +263,12 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
           if (e) repoPaths.set(groupPath, e.path);
         }
 
-        const wsResult = await discoverWorkspaceLinks(config.repos, repoPaths, dbExecutors);
+        const wsResult = await discoverWorkspaceLinks(
+          config.repos,
+          repoPaths,
+          dbExecutors,
+          config.matching,
+        );
         if (wsResult.links.length > 0) {
           allLinks = [...allLinks, ...wsResult.links];
           if (opts?.verbose) {

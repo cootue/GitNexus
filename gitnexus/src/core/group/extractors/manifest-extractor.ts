@@ -41,7 +41,7 @@ export class ManifestExtractor {
       // Fix 15d: include consumerFilePath for xml-ref links so the same base
       // type referenced from multiple XML files produces distinct consumer-side
       // entries.
-      const key = `${repo}\u0000${link.type}\u0000${link.contract}\u0000${link.extSymbol || ''}\u0000${link.consumerFilePath || ''}`;
+      const key = `${repo}\u0000${link.type}\u0000${link.contract}\u0000${link.extSymbol || ''}\u0000${link.consumerFilePath || ''}\u0000${link.consumerModuleDir || ''}`;
       let pending = resolveCache.get(key);
       if (!pending) {
         pending = this.resolveSymbol(repo, link, dbExecutors);
@@ -83,6 +83,10 @@ export class ManifestExtractor {
     const contractCandidates: StoredContract[] = [];
     const crossLinkCandidates: Array<CrossLink & { _providerFilePath: string }> = [];
 
+    // Helper: manifest:: UIDs indicate unresolved symbols (no graph match).
+    // Their confidence is 0.5 (heuristic, not exact graph resolution).
+    const isManifest = (uid: string): boolean => uid.startsWith('manifest::');
+
     for (const {
       link,
       contractId,
@@ -118,7 +122,7 @@ export class ManifestExtractor {
         symbolUid: providerUid,
         symbolRef: providerRef,
         symbolName: link.contract,
-        confidence: 1.0,
+        confidence: isManifest(providerUid) ? 0.5 : 1.0,
         meta: { source: 'manifest' },
         repo: providerRepo,
       });
@@ -130,7 +134,7 @@ export class ManifestExtractor {
         symbolUid: consumerUid,
         symbolRef: consumerRef,
         symbolName: consumerSymbolName,
-        confidence: 1.0,
+        confidence: isManifest(consumerUid) ? 0.5 : 1.0,
         meta: { source: 'manifest' },
         repo: consumerRepo,
       });
@@ -145,7 +149,7 @@ export class ManifestExtractor {
         type: link.type,
         contractId,
         matchType: 'manifest',
-        confidence: 1.0,
+        confidence: isManifest(providerUid) || isManifest(consumerUid) ? 0.5 : 1.0,
         _providerFilePath: providerRef.filePath,
       });
     }

@@ -71,6 +71,16 @@ export interface MatchingConfig {
    * @default false
    */
   exclude_links_param_only_paths?: boolean;
+  /**
+   * Workspace module directories (relative to repo root, forward-slash) to
+   * exclude from workspace dependency scanning. Modules whose `moduleDir`
+   * starts with any of these paths are skipped entirely — no imports,
+   * inheritance, override, or xml-ref links are emitted. Useful for
+   * excluding generated-code modules or test harnesses that create
+   * false cross-repo links.
+   * @default []
+   */
+  exclude_workspace_paths?: string[];
 }
 
 export interface SymbolRef {

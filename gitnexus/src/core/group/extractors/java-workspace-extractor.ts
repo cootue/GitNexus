@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { CypherExecutor } from '../contract-extractor.js';
-import type { GroupManifestLink, ContractRole } from '../types.js';
+import type { GroupManifestLink, ContractRole, MatchingConfig } from '../types.js';
 import { shouldIgnorePath, loadIgnoreRules } from '../../../config/ignore-service.js';
 
 import { logger } from '../../logger.js';
@@ -1045,6 +1045,7 @@ export async function extractJavaWorkspaceLinks(
   repos: Record<string, string>,
   repoPaths: Map<string, string>,
   _dbExecutors?: Map<string, CypherExecutor>,
+  matchingConfig?: MatchingConfig,
 ): Promise<JavaWorkspaceResult> {
   const projectsByKey = new Map<string, JavaProjectMeta>();
   const projectsByGroupPath = new Map<string, JavaProjectMeta>();
@@ -1171,7 +1172,13 @@ export async function extractJavaWorkspaceLinks(
   // Iterate ALL modules (top-level + leaf modules from BFS) as potential
   // consumers. For each module, scan Java imports only within its own
   // directory so imports from sibling modules don't pollute the results.
-  const allModules = [...projectsByKey.values()];
+  // Fix 21: exclude workspace modules by path.
+  const excludeWsPaths = matchingConfig?.exclude_workspace_paths || [];
+  const allModules = [...projectsByKey.values()].filter((proj) => {
+    if (!proj.moduleDir || excludeWsPaths.length === 0) return true;
+    const relModuleDir = path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/');
+    return !excludeWsPaths.some((p) => relModuleDir.startsWith(p.replace(/\\/g, '/')));
+  });
   for (const proj of allModules) {
     const groupDeps = proj.deps.filter((d) => projectsByKey.has(d));
     if (groupDeps.length === 0) continue;
@@ -1211,6 +1218,9 @@ export async function extractJavaWorkspaceLinks(
         type: 'custom',
         contract: qualifiedContract,
         role: 'provider' as ContractRole,
+        consumerModuleDir: proj.moduleDir
+          ? path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/')
+          : null,
       };
       links.push(link);
     }
@@ -1236,6 +1246,9 @@ export async function extractJavaWorkspaceLinks(
         contract: qualifiedContract,
         extSymbol: inh.extSymbolName,
         role: 'provider' as ContractRole,
+        consumerModuleDir: proj.moduleDir
+          ? path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/')
+          : null,
       });
     }
 
@@ -1260,6 +1273,9 @@ export async function extractJavaWorkspaceLinks(
         contract: qualifiedContract,
         extSymbol: ov.extSymbolName,
         role: 'provider' as ContractRole,
+        consumerModuleDir: proj.moduleDir
+          ? path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/')
+          : null,
       });
     }
 
@@ -1284,6 +1300,9 @@ export async function extractJavaWorkspaceLinks(
         contract: qualifiedContract,
         consumerFilePath: ref.filePath,
         role: 'provider' as ContractRole,
+        consumerModuleDir: proj.moduleDir
+          ? path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/')
+          : null,
       });
     }
   }
