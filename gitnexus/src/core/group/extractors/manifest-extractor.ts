@@ -35,7 +35,10 @@ export class ManifestExtractor {
     type ResolvedSymbol = { filePath: string; name: string; uid: string } | null;
     const resolveCache = new Map<string, Promise<ResolvedSymbol>>();
     const resolveOnce = (repo: string, link: GroupManifestLink): Promise<ResolvedSymbol> => {
-      const key = `${repo}\u0000${link.type}\u0000${link.contract}`;
+      // Fix 14a: include extSymbol in cache key for extends/implements/override
+      // links — multiple ext classes can implement the same base and each must
+      // resolve to its own symbol node.
+      const key = `${repo}\u0000${link.type}\u0000${link.contract}\u0000${link.extSymbol || ''}`;
       let pending = resolveCache.get(key);
       if (!pending) {
         pending = this.resolveSymbol(repo, link, dbExecutors);
@@ -86,7 +89,15 @@ export class ManifestExtractor {
       consumerSymbol,
     } of perLink) {
       const providerRef = providerSymbol || { filePath: '', name: link.contract };
-      const consumerRef = consumerSymbol || { filePath: '', name: link.contract };
+      // Fix 13/14b: For extends/implements/override links, the consumer
+      // symbol name is the ext class (link.extSymbol), not the base class
+      // (link.contract).
+      const consumerSymbolName =
+        (link.type === 'extends' || link.type === 'implements' || link.type === 'override') &&
+        link.extSymbol
+          ? link.extSymbol
+          : link.contract;
+      const consumerRef = consumerSymbol || { filePath: '', name: consumerSymbolName };
       const providerUid = providerSymbol?.uid || manifestSymbolUid(providerRepo, contractId);
       const consumerUid = consumerSymbol?.uid || manifestSymbolUid(consumerRepo, contractId);
 
@@ -108,7 +119,7 @@ export class ManifestExtractor {
         role: 'consumer',
         symbolUid: consumerUid,
         symbolRef: consumerRef,
-        symbolName: link.contract,
+        symbolName: consumerSymbolName,
         confidence: 1.0,
         meta: { source: 'manifest' },
         repo: consumerRepo,
@@ -184,11 +195,13 @@ export class ManifestExtractor {
 
     const contracts = contractCandidates.filter((c) => bestContractIds.has(c.contractId));
 
-    // Dedup cross-links by (type, fromRepo, toRepo, providerFilePath, symbolName)
-    // — keep the best match.
+    // Dedup cross-links by (type, fromRepo, toRepo, providerFilePath, providerName, consumerName)
+    // — keep the best match. Fix 13: type included so extends cross-links aren't deduped
+    // against custom. Fix 14a: consumer symbol name included so multiple ext classes
+    // implementing the same base each survive dedup.
     const clGroups = new Map<string, typeof crossLinkCandidates>();
     for (const cl of crossLinkCandidates) {
-      const gk = `${cl.type}\0${cl.from.repo}\0${cl.to.repo}\0${cl._providerFilePath}\0${cl.to.symbolRef.name}`;
+      const gk = `${cl.type}\0${cl.from.repo}\0${cl.to.repo}\0${cl._providerFilePath}\0${cl.to.symbolRef.name}\0${cl.from.symbolRef.name}`;
       const existing = clGroups.get(gk);
       if (existing) existing.push(cl);
       else clGroups.set(gk, [cl]);
@@ -314,6 +327,37 @@ export class ManifestExtractor {
             { symbolName },
           );
         }
+      } else if (
+        link.type === 'extends' ||
+        link.type === 'implements' ||
+        link.type === 'override'
+      ) {
+        // Fix 13/14b/17: Cross-repo inheritance/implements/override link.
+        // Provider side: resolve the BASE class (link.contract = "artifactId::BaseName")
+        // Consumer side: resolve the EXT class (link.extSymbol = "ExtName")
+        const isProvider = repoPathKey === link.from;
+        const symbolName = isProvider
+          ? link.contract.includes('::')
+            ? link.contract.split('::').pop()!
+            : link.contract
+          : link.extSymbol ||
+            (link.contract.includes('::') ? link.contract.split('::').pop()! : link.contract);
+        rows = await executor(
+          `MATCH (n:Class|Interface|Method|Function) WHERE n.name = $symbolName
+           RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+           ORDER BY n.filePath ASC
+           LIMIT 1`,
+          { symbolName },
+        );
+        if (rows.length === 0) {
+          rows = await executor(
+            `MATCH (n:Enum|Struct|Trait|Constructor|CodeElement) WHERE n.name = $symbolName
+             RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+             ORDER BY n.filePath ASC
+             LIMIT 1`,
+            { symbolName },
+          );
+        }
       } else {
         return null;
       }
@@ -351,6 +395,12 @@ export class ManifestExtractor {
         return `lib::${contract}`;
       case 'custom':
         return `custom::${contract}`;
+      case 'extends':
+        return `extends::${contract}`;
+      case 'implements':
+        return `implements::${contract}`;
+      case 'override':
+        return `override::${contract}`;
       case 'include':
         return `include::${contract}`;
       default: {

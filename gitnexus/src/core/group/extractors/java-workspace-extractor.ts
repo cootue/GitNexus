@@ -21,6 +21,14 @@ interface ImportedSymbol {
   filePath: string;
 }
 
+interface InheritanceOrOverrideSymbol {
+  artifactKey: string;
+  baseSymbolName: string;
+  extSymbolName: string;
+  filePath: string;
+  relType: 'extends' | 'implements' | 'override';
+}
+
 interface PomResult {
   groupId: string;
   artifactId: string;
@@ -264,6 +272,218 @@ async function scanJavaImports(
   return results;
 }
 
+// Cross-repo inheritance detection: parse extends/implements from Java
+// class/interface/enum declarations. When a base class/interface belongs
+// to a different artifact (dependency), emit a cross-repo inheritance link.
+// Uses importMap for FQN resolution; Commit 8 adds resolveTypeName with
+// same-package fallback, FQN passthrough, and local/JDK guards.
+async function scanJavaInheritance(
+  repoPath: string,
+  knownPackages: Map<string, Set<string>>,
+): Promise<InheritanceOrOverrideSymbol[]> {
+  const results: InheritanceOrOverrideSymbol[] = [];
+  const sourceFiles = await findJavaFiles(repoPath);
+  const sortedPkgs = [...knownPackages.entries()].sort((a, b) => b[0].length - a[0].length);
+
+  for (const relFile of sourceFiles) {
+    const absPath = path.join(repoPath, relFile);
+    let content: string;
+    try {
+      content = await fs.readFile(absPath, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    // Build import table: short name → FQN
+    const importMap = new Map<string, string>();
+    const importRegex = /^import\s+(?:static\s+)?([a-zA-Z][\w.]*\.[A-Z]\w*)/gm;
+    let imMatch: RegExpExecArray | null;
+    while ((imMatch = importRegex.exec(content)) !== null) {
+      const fqn = imMatch[1];
+      const parts = fqn.split('.');
+      const shortName = parts[parts.length - 1];
+      importMap.set(shortName, fqn);
+    }
+
+    // Basic type resolution: importMap lookup + FQN passthrough.
+    // Commit 8 will add same-package fallback, local/JDK guards, inner-type.
+    const resolveTypeName = (name: string): string | null => {
+      if (name.includes('.')) {
+        // If first segment starts with uppercase → inner-type notation
+        // (not handled here, Commit 8). True FQN: passthrough.
+        if (/^[a-z]/.test(name)) return name;
+        return null; // inner-type — skip for now
+      }
+      return importMap.get(name) ?? null;
+    };
+
+    // Parse class/interface/enum extends (single base).
+    // Commit 8 adds ifaceExtendsRegex for multi-base interface extends.
+    const declRegex =
+      /^(?:public\s+|protected\s+|private\s+)?(?:abstract\s+)?(?:static\s+)?(?:final\s+)?(?:class|interface|enum)\s+([A-Z]\w*)(?:<[^{]*>)?\s+extends\s+([\w.]+)(?:<[^{]*>)?/gm;
+    let declMatch: RegExpExecArray | null;
+    while ((declMatch = declRegex.exec(content)) !== null) {
+      const extClassName = declMatch[1];
+      const baseRaw = declMatch[2];
+      let baseShortName: string;
+      if (baseRaw.includes('.') && /^[A-Z]/.test(baseRaw.split('.')[0])) {
+        baseShortName = baseRaw.split('.')[0]; // inner-type: outer class
+      } else if (baseRaw.includes('.')) {
+        baseShortName = baseRaw.split('.').pop()!; // FQN: last segment
+      } else {
+        baseShortName = baseRaw;
+      }
+      if (!/^[A-Z]\w*$/.test(baseShortName)) continue;
+      const baseFqn = resolveTypeName(baseRaw);
+      if (!baseFqn) continue;
+
+      const emitted = new Set<string>();
+      for (const [basePkg, claimants] of sortedPkgs) {
+        if (baseFqn.startsWith(basePkg + '.') || baseFqn === basePkg) {
+          for (const ak of claimants) {
+            const dk = `${basePkg}::${ak}`;
+            if (emitted.has(dk)) continue;
+            emitted.add(dk);
+            results.push({
+              artifactKey: ak,
+              baseSymbolName: baseShortName,
+              extSymbolName: extClassName,
+              filePath: relFile,
+              relType: 'extends',
+            });
+          }
+        }
+      }
+    }
+
+    // Parse implements clause (comma-separated).
+    // class X extends Y implements A, B<T>, C
+    // enum X implements A, B<T>, C
+    const implRegex =
+      /^(?:public\s+|protected\s+)?(?:abstract\s+)?(?:static\s+)?(?:final\s+)?(?:class|enum)\s+[A-Z]\w*(?:<[^{]*>)?(?:\s+extends\s+[\w.]+(?:<[^{]*>)?)?\s+implements\s+([\w.]+(?:<[^{]*>)?(?:\s*,\s*[\w.]+(?:<[^{]*>)?)*)/gm;
+    let implMatch: RegExpExecArray | null;
+    while ((implMatch = implRegex.exec(content)) !== null) {
+      const implList = implMatch[1];
+      // Strip generics before splitting on comma to avoid
+      // breaking on type-arg commas (e.g. Foo<A, B>, Qux).
+      let implCleaned = implList;
+      while (/<[^<>]*>/.test(implCleaned)) implCleaned = implCleaned.replace(/<[^<>]*>/g, '');
+      const implNames = implCleaned
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => /^[\w.]+$/.test(s) && /^[A-Z]\w*$/.test(s.split('.').pop()!));
+      const extMatch = content.slice(implMatch.index).match(/(?:class|enum)\s+([A-Z]\w*)/);
+      if (!extMatch) continue;
+      const extClassName = extMatch[1];
+
+      for (const implRaw of implNames) {
+        let implShortName: string;
+        if (implRaw.includes('.') && /^[A-Z]/.test(implRaw.split('.')[0])) {
+          implShortName = implRaw.split('.')[0]; // inner-type: outer class
+        } else if (implRaw.includes('.')) {
+          implShortName = implRaw.split('.').pop()!; // FQN: last segment
+        } else {
+          implShortName = implRaw;
+        }
+        const implFqn = resolveTypeName(implRaw);
+        if (!implFqn) continue;
+
+        const emitted = new Set<string>();
+        for (const [basePkg, claimants] of sortedPkgs) {
+          if (implFqn.startsWith(basePkg + '.') || implFqn === basePkg) {
+            for (const ak of claimants) {
+              const dk = `${basePkg}::${ak}`;
+              if (emitted.has(dk)) continue;
+              emitted.add(dk);
+              results.push({
+                artifactKey: ak,
+                baseSymbolName: implShortName,
+                extSymbolName: extClassName,
+                filePath: relFile,
+                relType: 'implements',
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+  return results;
+}
+
+// Detect non-inheritance factory override patterns.
+// *Factory.override*(Base.class, Ext.class) links factories where
+// ExtFactory extends AbstractRequestFactory, not BaseFactory — the
+// override call IS the cross-repo dependency link.
+// Fix 15a: Generic regex (not hardcoded TransactionFactory).
+async function scanJavaOverride(
+  repoPath: string,
+  knownPackages: Map<string, Set<string>>,
+): Promise<InheritanceOrOverrideSymbol[]> {
+  const results: InheritanceOrOverrideSymbol[] = [];
+  const sourceFiles = await findJavaFiles(repoPath);
+  const sortedPkgs = [...knownPackages.entries()].sort((a, b) => b[0].length - a[0].length);
+
+  for (const relFile of sourceFiles) {
+    const absPath = path.join(repoPath, relFile);
+    let content: string;
+    try {
+      content = await fs.readFile(absPath, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    // Build import table: short name → FQN
+    const importMap = new Map<string, string>();
+    const importRegex = /^import\s+(?:static\s+)?([a-zA-Z][\w.]*\.[A-Z]\w*)/gm;
+    let imMatch: RegExpExecArray | null;
+    while ((imMatch = importRegex.exec(content)) !== null) {
+      const fqn = imMatch[1];
+      const parts = fqn.split('.');
+      const shortName = parts[parts.length - 1];
+      importMap.set(shortName, fqn);
+    }
+
+    const resolveTypeName = (name: string): string | null => {
+      if (name.includes('.')) {
+        if (/^[a-z]/.test(name)) return name;
+        return null;
+      }
+      return importMap.get(name) ?? null;
+    };
+
+    // Generic override pattern: SomeFactory.overrideSomething(Base.class, Ext.class)
+    const overrideRegex =
+      /([A-Z]\w*Factory)\s*\.\s*(override\w+)\s*\(\s*([A-Z]\w*)\.class\s*,\s*([A-Z]\w*)\.class\s*\)/g;
+    let overrideMatch: RegExpExecArray | null;
+    while ((overrideMatch = overrideRegex.exec(content)) !== null) {
+      const baseShortName = overrideMatch[3];
+      const extShortName = overrideMatch[4];
+      const baseFqn = resolveTypeName(baseShortName);
+      if (!baseFqn) continue;
+
+      const emitted = new Set<string>();
+      for (const [basePkg, claimants] of sortedPkgs) {
+        if (baseFqn.startsWith(basePkg + '.') || baseFqn === basePkg) {
+          for (const ak of claimants) {
+            const dk = `${basePkg}::${ak}`;
+            if (emitted.has(dk)) continue;
+            emitted.add(dk);
+            results.push({
+              artifactKey: ak,
+              baseSymbolName: baseShortName,
+              extSymbolName: extShortName,
+              filePath: relFile,
+              relType: 'override',
+            });
+          }
+        }
+      }
+    }
+  }
+  return results;
+}
+
 function isPascalCase(name: string): boolean {
   return /^[A-Z][A-Za-z0-9]*$/.test(name);
 }
@@ -462,6 +682,54 @@ export async function extractJavaWorkspaceLinks(
         role: 'provider' as ContractRole,
       };
       links.push(link);
+    }
+
+    // Scan cross-repo inheritance (extends/implements). Emits links with
+    // the ext class name in extSymbol so manifest-extractor can resolve
+    // the consumer symbol as the ext class (not the base class).
+    const inheritances = await scanJavaInheritance(scanDir, knownPackages);
+    for (const inh of inheritances) {
+      const providerProj = projectsByKey.get(inh.artifactKey);
+      if (!providerProj) continue;
+      if (providerProj.groupPath === proj.groupPath) continue;
+
+      const qualifiedContract = `${providerProj.artifactId}::${inh.baseSymbolName}`;
+      const dedupKey = `${proj.groupPath}→${providerProj.groupPath}::${inh.relType}::${qualifiedContract}::${inh.extSymbolName}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+
+      links.push({
+        from: providerProj.groupPath,
+        to: proj.groupPath,
+        type: inh.relType,
+        contract: qualifiedContract,
+        extSymbol: inh.extSymbolName,
+        role: 'provider' as ContractRole,
+      });
+    }
+
+    // Scan for non-inheritance factory override patterns.
+    // *Factory.override*(Base.class, Ext.class) links factories where
+    // ExtFactory extends AbstractRequestFactory, not BaseFactory.
+    const overrides = await scanJavaOverride(scanDir, knownPackages);
+    for (const ov of overrides) {
+      const providerProj = projectsByKey.get(ov.artifactKey);
+      if (!providerProj) continue;
+      if (providerProj.groupPath === proj.groupPath) continue;
+
+      const qualifiedContract = `${providerProj.artifactId}::${ov.baseSymbolName}`;
+      const dedupKey = `${proj.groupPath}→${providerProj.groupPath}::override::${qualifiedContract}::${ov.extSymbolName}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+
+      links.push({
+        from: providerProj.groupPath,
+        to: proj.groupPath,
+        type: 'override',
+        contract: qualifiedContract,
+        extSymbol: ov.extSymbolName,
+        role: 'provider' as ContractRole,
+      });
     }
   }
 

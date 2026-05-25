@@ -1,4 +1,14 @@
-export type ContractType = 'http' | 'grpc' | 'thrift' | 'topic' | 'lib' | 'custom' | 'include';
+export type ContractType =
+  | 'http'
+  | 'grpc'
+  | 'thrift'
+  | 'topic'
+  | 'lib'
+  | 'custom'
+  | 'include'
+  | 'extends'
+  | 'implements'
+  | 'override';
 export type MatchType = 'exact' | 'manifest' | 'wildcard' | 'bm25' | 'embedding';
 export type ContractRole = 'provider' | 'consumer';
 
@@ -19,6 +29,12 @@ export interface GroupManifestLink {
   type: ContractType;
   contract: string;
   role: ContractRole;
+  /** Extended/consumer symbol name for inheritance/override links (e.g. "ExtClass"). */
+  extSymbol?: string;
+  /** Module directory relative to repo root (forward-slash), for workspace path filtering. */
+  consumerModuleDir?: string | null;
+  /** Resource file path for xml-ref links (relative to repo root). */
+  consumerFilePath?: string;
 }
 
 export interface DetectConfig {
