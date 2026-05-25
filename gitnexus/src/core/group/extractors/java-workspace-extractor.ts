@@ -275,8 +275,9 @@ async function scanJavaImports(
 // Cross-repo inheritance detection: parse extends/implements from Java
 // class/interface/enum declarations. When a base class/interface belongs
 // to a different artifact (dependency), emit a cross-repo inheritance link.
-// Uses importMap for FQN resolution; Commit 8 adds resolveTypeName with
-// same-package fallback, FQN passthrough, and local/JDK guards.
+// resolveTypeName resolves via importMap, same-package fallback, FQN
+// passthrough, inner-type handling; localClassNames + jdkClassNames guard
+// against intra-repo and JDK false positives.
 async function scanJavaInheritance(
   repoPath: string,
   knownPackages: Map<string, Set<string>>,
@@ -284,6 +285,61 @@ async function scanJavaInheritance(
   const results: InheritanceOrOverrideSymbol[] = [];
   const sourceFiles = await findJavaFiles(repoPath);
   const sortedPkgs = [...knownPackages.entries()].sort((a, b) => b[0].length - a[0].length);
+
+  // Build set of class names that exist in this repo (from .java filenames).
+  // Used to guard against intra-repo same-package fallback FP.
+  const localClassNames = new Set<string>();
+  for (const relFile of sourceFiles) {
+    const baseName = path.basename(relFile, path.extname(relFile));
+    if (/^[A-Z]/.test(baseName)) localClassNames.add(baseName);
+  }
+
+  // Common JDK/framework class names to prevent FP from same-package
+  // fallback when extending JDK types without explicit import.
+  const jdkClassNames = new Set([
+    'RuntimeException',
+    'Exception',
+    'Throwable',
+    'Error',
+    'AutoCloseable',
+    'Closeable',
+    'Serializable',
+    'Cloneable',
+    'Comparable',
+    'Runnable',
+    'Thread',
+    'Object',
+    'String',
+    'Number',
+    'Integer',
+    'Long',
+    'Double',
+    'Float',
+    'Short',
+    'Byte',
+    'Boolean',
+    'Character',
+    'Void',
+    'Enum',
+    'Iterable',
+    'Iterator',
+    'Collection',
+    'List',
+    'Set',
+    'Map',
+    'ClassLoader',
+    'StackTraceElement',
+    'StringBuilder',
+    'StringBuffer',
+    'Service',
+    'Appendable',
+    'CharSequence',
+    'Readable',
+    'SuppressWarnings',
+    'Override',
+    'Deprecated',
+    'FunctionalInterface',
+  ]);
 
   for (const relFile of sourceFiles) {
     const absPath = path.join(repoPath, relFile);
@@ -305,26 +361,49 @@ async function scanJavaInheritance(
       importMap.set(shortName, fqn);
     }
 
-    // Basic type resolution: importMap lookup + FQN passthrough.
-    // Commit 8 will add same-package fallback, local/JDK guards, inner-type.
+    // Same-package fallback for type resolution. When `extends Foo` has
+    // no `import` it's a same-package reference. Resolve to
+    // `<thisPackage>.Foo` so the multi-claimant package lookup can still
+    // link it to cross-repo providers exporting the same package.
+    // Filter via sortedPkgs guarantees JDK/framework classes are dropped.
+    const packageMatch = content.match(/^package\s+([\w.]+)\s*;/m);
+    const thisPackage = packageMatch ? packageMatch[1] : null;
+
     const resolveTypeName = (name: string): string | null => {
+      // Inner-type handling: OuterType.InnerType
       if (name.includes('.')) {
-        // If first segment starts with uppercase → inner-type notation
-        // (not handled here, Commit 8). True FQN: passthrough.
-        if (/^[a-z]/.test(name)) return name;
-        return null; // inner-type — skip for now
+        const firstDot = name.indexOf('.');
+        const outerName = name.substring(0, firstDot);
+        if (/^[A-Z]/.test(outerName)) {
+          // Inner-type notation: resolve outer's FQN first
+          const innerPart = name.substring(firstDot);
+          const outerFqn = importMap.get(outerName);
+          if (outerFqn) return outerFqn + innerPart;
+          if (localClassNames.has(outerName)) return null; // intra-repo
+          if (jdkClassNames.has(outerName)) return null; // JDK
+          if (thisPackage) return `${thisPackage}.${name}`;
+          return null;
+        }
+        // True FQN (lowercase first segment = package): passthrough
+        return name;
       }
-      return importMap.get(name) ?? null;
+      // Simple name
+      const fromImport = importMap.get(name);
+      if (fromImport) return fromImport;
+      if (localClassNames.has(name)) return null; // intra-repo
+      if (jdkClassNames.has(name)) return null; // JDK
+      if (thisPackage) return `${thisPackage}.${name}`;
+      return null;
     };
 
-    // Parse class/interface/enum extends (single base).
-    // Commit 8 adds ifaceExtendsRegex for multi-base interface extends.
+    // Parse class/interface/enum extends (single base from declRegex).
     const declRegex =
       /^(?:public\s+|protected\s+|private\s+)?(?:abstract\s+)?(?:static\s+)?(?:final\s+)?(?:class|interface|enum)\s+([A-Z]\w*)(?:<[^{]*>)?\s+extends\s+([\w.]+)(?:<[^{]*>)?/gm;
     let declMatch: RegExpExecArray | null;
     while ((declMatch = declRegex.exec(content)) !== null) {
       const extClassName = declMatch[1];
       const baseRaw = declMatch[2];
+      // Inner-type uses outer class name for contract symbol.
       let baseShortName: string;
       if (baseRaw.includes('.') && /^[A-Z]/.test(baseRaw.split('.')[0])) {
         baseShortName = baseRaw.split('.')[0]; // inner-type: outer class
@@ -359,15 +438,16 @@ async function scanJavaInheritance(
     // Parse implements clause (comma-separated).
     // class X extends Y implements A, B<T>, C
     // enum X implements A, B<T>, C
+    // Strip generics BEFORE splitting on comma to avoid breaking on
+    // type-arg commas (e.g. Foo<A, B>, Qux).
     const implRegex =
       /^(?:public\s+|protected\s+)?(?:abstract\s+)?(?:static\s+)?(?:final\s+)?(?:class|enum)\s+[A-Z]\w*(?:<[^{]*>)?(?:\s+extends\s+[\w.]+(?:<[^{]*>)?)?\s+implements\s+([\w.]+(?:<[^{]*>)?(?:\s*,\s*[\w.]+(?:<[^{]*>)?)*)/gm;
     let implMatch: RegExpExecArray | null;
     while ((implMatch = implRegex.exec(content)) !== null) {
       const implList = implMatch[1];
-      // Strip generics before splitting on comma to avoid
-      // breaking on type-arg commas (e.g. Foo<A, B>, Qux).
       let implCleaned = implList;
       while (/<[^<>]*>/.test(implCleaned)) implCleaned = implCleaned.replace(/<[^<>]*>/g, '');
+      // Accept FQN (com.foo.Bar) and short names; filter by Pascal last segment.
       const implNames = implCleaned
         .split(',')
         .map((s) => s.trim())
@@ -377,6 +457,7 @@ async function scanJavaInheritance(
       const extClassName = extMatch[1];
 
       for (const implRaw of implNames) {
+        // Inner-type uses outer class name for contract symbol.
         let implShortName: string;
         if (implRaw.includes('.') && /^[A-Z]/.test(implRaw.split('.')[0])) {
           implShortName = implRaw.split('.')[0]; // inner-type: outer class
@@ -407,6 +488,55 @@ async function scanJavaInheritance(
         }
       }
     }
+
+    // Parse interface multi-base extends.
+    // declRegex captures only the FIRST base for `interface X extends A, B`.
+    // This regex captures the full comma-separated list and lets the dedup
+    // in the main loop skip overlap with declRegex's single-base emission.
+    const ifaceExtendsRegex =
+      /^(?:public\s+|protected\s+)?interface\s+([A-Z]\w*)(?:<[^{]*>)?\s+extends\s+([^{]+?)\s*\{/gm;
+    let ifaceMatch: RegExpExecArray | null;
+    while ((ifaceMatch = ifaceExtendsRegex.exec(content)) !== null) {
+      const extClassName = ifaceMatch[1];
+      const basesList = ifaceMatch[2];
+      let baseCleaned = basesList;
+      while (/<[^<>]*>/.test(baseCleaned)) baseCleaned = baseCleaned.replace(/<[^<>]*>/g, '');
+      const baseNames = baseCleaned
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => /^[\w.]+$/.test(s) && /^[A-Z]\w*$/.test(s.split('.').pop()!));
+
+      for (const baseRaw of baseNames) {
+        let baseShortName: string;
+        if (baseRaw.includes('.') && /^[A-Z]/.test(baseRaw.split('.')[0])) {
+          baseShortName = baseRaw.split('.')[0]; // inner-type: outer class
+        } else if (baseRaw.includes('.')) {
+          baseShortName = baseRaw.split('.').pop()!; // FQN: last segment
+        } else {
+          baseShortName = baseRaw;
+        }
+        const baseFqn = resolveTypeName(baseRaw);
+        if (!baseFqn) continue;
+
+        const emitted = new Set<string>();
+        for (const [basePkg, claimants] of sortedPkgs) {
+          if (baseFqn.startsWith(basePkg + '.') || baseFqn === basePkg) {
+            for (const ak of claimants) {
+              const dk = `${basePkg}::${ak}`;
+              if (emitted.has(dk)) continue;
+              emitted.add(dk);
+              results.push({
+                artifactKey: ak,
+                baseSymbolName: baseShortName,
+                extSymbolName: extClassName,
+                filePath: relFile,
+                relType: 'extends',
+              });
+            }
+          }
+        }
+      }
+    }
   }
   return results;
 }
@@ -423,6 +553,58 @@ async function scanJavaOverride(
   const results: InheritanceOrOverrideSymbol[] = [];
   const sourceFiles = await findJavaFiles(repoPath);
   const sortedPkgs = [...knownPackages.entries()].sort((a, b) => b[0].length - a[0].length);
+
+  // Build set of class names that exist in this repo.
+  const localClassNames = new Set<string>();
+  for (const relFile of sourceFiles) {
+    const baseName = path.basename(relFile, path.extname(relFile));
+    if (/^[A-Z]/.test(baseName)) localClassNames.add(baseName);
+  }
+
+  const jdkClassNames = new Set([
+    'RuntimeException',
+    'Exception',
+    'Throwable',
+    'Error',
+    'AutoCloseable',
+    'Closeable',
+    'Serializable',
+    'Cloneable',
+    'Comparable',
+    'Runnable',
+    'Thread',
+    'Object',
+    'String',
+    'Number',
+    'Integer',
+    'Long',
+    'Double',
+    'Float',
+    'Short',
+    'Byte',
+    'Boolean',
+    'Character',
+    'Void',
+    'Enum',
+    'Iterable',
+    'Iterator',
+    'Collection',
+    'List',
+    'Set',
+    'Map',
+    'ClassLoader',
+    'StackTraceElement',
+    'StringBuilder',
+    'StringBuffer',
+    'Service',
+    'Appendable',
+    'CharSequence',
+    'Readable',
+    'SuppressWarnings',
+    'Override',
+    'Deprecated',
+    'FunctionalInterface',
+  ]);
 
   for (const relFile of sourceFiles) {
     const absPath = path.join(repoPath, relFile);
@@ -444,12 +626,22 @@ async function scanJavaOverride(
       importMap.set(shortName, fqn);
     }
 
+    // Same-package fallback + local/JDK guards.
+    const packageMatch = content.match(/^package\s+([\w.]+)\s*;/m);
+    const thisPackage = packageMatch ? packageMatch[1] : null;
+
     const resolveTypeName = (name: string): string | null => {
+      // NO inner-type handling — overrideRegex captures only simple names.
       if (name.includes('.')) {
-        if (/^[a-z]/.test(name)) return name;
-        return null;
+        if (/^[a-z]/.test(name)) return name; // FQN passthrough
+        return null; // shouldn't happen for override, but guard
       }
-      return importMap.get(name) ?? null;
+      const fromImport = importMap.get(name);
+      if (fromImport) return fromImport;
+      if (localClassNames.has(name)) return null; // intra-repo
+      if (jdkClassNames.has(name)) return null; // JDK
+      if (thisPackage) return `${thisPackage}.${name}`;
+      return null;
     };
 
     // Generic override pattern: SomeFactory.overrideSomething(Base.class, Ext.class)
