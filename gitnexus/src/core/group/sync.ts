@@ -324,7 +324,79 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
   const crossLinks = dedupeMultiClaimantCrossLinks(
     dedupeCrossLinks([...manifestCrossLinks, ...matched, ...wildcard.matched]),
   );
-  const allContracts: StoredContract[] = autoContracts;
+
+  // Consumer contract dedup (fix for Commit 6's incorrect "each consumer
+  // is unique per repo" assumption). After Commit 5's multi-claimant
+  // emission, the same symbol in the same repo can have multiple consumer
+  // contracts with different claimant artifact keys. Group by
+  // (repo, type, bareSymbolName, filePath) and keep the best matchScore,
+  // but unconditionally preserve contracts referenced by surviving cross-links.
+  // This MUST run after the final cross-link dedup so we know which
+  // cross-links actually survive the full pipeline.
+  // NOTE: We match by contractId (not symbolUid) because multi-claimant
+  // consumers in the same dedup group share the same symbolUid — a uid-based
+  // check would preserve ALL of them, defeating the dedup.
+  const crossLinkContractIds = new Set<string>();
+  for (const cl of crossLinks) {
+    crossLinkContractIds.add(cl.contractId);
+  }
+  function bestMatchScore(contractId: string, filePath: string): number {
+    if (!filePath || filePath === '') return 0;
+    const dirParts = filePath.split('/').slice(0, -1);
+    let score = 0;
+    for (const part of dirParts) {
+      if (contractId.includes(part)) score++;
+    }
+    return score;
+  }
+  const consumerGroups = new Map<string, StoredContract[]>();
+  for (const c of autoContracts) {
+    if (c.role !== 'consumer') continue;
+    const bareSymbol = c.contractId.split('::').pop() ?? c.contractId;
+    const gk = `${c.repo}\0${c.type}\0${bareSymbol}\0${c.symbolRef.filePath}`;
+    const existing = consumerGroups.get(gk);
+    if (existing) existing.push(c);
+    else consumerGroups.set(gk, [c]);
+  }
+  const survivingConsumerIds = new Set<string>();
+  for (const [, group] of consumerGroups) {
+    if (group.length <= 1) {
+      survivingConsumerIds.add(group[0].contractId);
+      continue;
+    }
+    // Keep contracts referenced by surviving cross-links (by contractId)
+    let groupHasCrossLinkRef = false;
+    for (const c of group) {
+      if (crossLinkContractIds.has(c.contractId)) {
+        survivingConsumerIds.add(c.contractId);
+        groupHasCrossLinkRef = true;
+      }
+    }
+    // If no contract in this group is referenced by cross-links, keep the best match score
+    if (!groupHasCrossLinkRef) {
+      let bestIdx = 0;
+      let bestScore = bestMatchScore(group[0].contractId, group[0].symbolRef.filePath);
+      for (let i = 1; i < group.length; i++) {
+        const s = bestMatchScore(group[i].contractId, group[i].symbolRef.filePath);
+        if (s > bestScore) {
+          bestScore = s;
+          bestIdx = i;
+        }
+      }
+      survivingConsumerIds.add(group[bestIdx].contractId);
+    }
+  }
+  const dedupedContracts = autoContracts.filter(
+    (c) => c.role !== 'consumer' || survivingConsumerIds.has(c.contractId),
+  );
+  const consumerRemoved = autoContracts.length - dedupedContracts.length;
+  if (consumerRemoved > 0) {
+    logger.info(
+      `[group/sync] consumer contract dedup: removed ${consumerRemoved} multi-claimant consumers`,
+    );
+  }
+
+  const allContracts: StoredContract[] = dedupedContracts;
 
   const registry: ContractRegistry = {
     version: 1,

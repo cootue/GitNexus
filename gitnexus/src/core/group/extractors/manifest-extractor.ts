@@ -201,8 +201,9 @@ export class ManifestExtractor {
       bestContractIds.add(group[bestIdx].contractId);
     }
 
-    // Also keep all consumer contracts (they don't have the over-approximation
-    // issue — each consumer is unique per repo).
+    // Also keep all consumer contracts — they'll be deduped in sync.ts after
+    // the final cross-link dedup (we need to know which cross-links survive
+    // the full pipeline before deciding which consumer contracts to keep).
     for (const c of contractCandidates) {
       if (c.role === 'consumer') bestContractIds.add(c.contractId);
     }
