@@ -386,13 +386,69 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
       survivingConsumerIds.add(group[bestIdx].contractId);
     }
   }
+  // Provider contract dedup (same root cause as consumer — multi-claimant
+  // over-approximation from JW's pkgClaimants). Group by
+  // (repo, type, bareSymbolName, filePath) using bareSymbolName (not
+  // symbolUid) because 24% of providers are unresolved (manifest:: UID)
+  // and their symbolUid varies per claimant, defeating symbolUid-based
+  // grouping. For resolved providers, both keys produce identical groups.
+  const providerGroups = new Map<string, StoredContract[]>();
+  for (const c of autoContracts) {
+    if (c.role !== 'provider') continue;
+    const bareSymbol = c.contractId.split('::').pop() ?? c.contractId;
+    const gk = `${c.repo}\0${c.type}\0${bareSymbol}\0${c.symbolRef.filePath}`;
+    const existing = providerGroups.get(gk);
+    if (existing) existing.push(c);
+    else providerGroups.set(gk, [c]);
+  }
+  const survivingProviderIds = new Set<string>();
+  for (const [, group] of providerGroups) {
+    if (group.length <= 1) {
+      survivingProviderIds.add(group[0].contractId);
+      continue;
+    }
+    // Keep providers referenced by surviving cross-links (by contractId)
+    let groupHasCrossLinkRef = false;
+    for (const c of group) {
+      if (crossLinkContractIds.has(c.contractId)) {
+        survivingProviderIds.add(c.contractId);
+        groupHasCrossLinkRef = true;
+      }
+    }
+    // If no provider in this group is referenced by cross-links, keep the best match score
+    if (!groupHasCrossLinkRef) {
+      let bestIdx = 0;
+      let bestScore = bestMatchScore(group[0].contractId, group[0].symbolRef.filePath);
+      for (let i = 1; i < group.length; i++) {
+        const s = bestMatchScore(group[i].contractId, group[i].symbolRef.filePath);
+        if (s > bestScore) {
+          bestScore = s;
+          bestIdx = i;
+        }
+      }
+      survivingProviderIds.add(group[bestIdx].contractId);
+    }
+  }
+
   const dedupedContracts = autoContracts.filter(
-    (c) => c.role !== 'consumer' || survivingConsumerIds.has(c.contractId),
+    (c) =>
+      (c.role === 'consumer' && survivingConsumerIds.has(c.contractId)) ||
+      (c.role === 'provider' && survivingProviderIds.has(c.contractId)),
   );
-  const consumerRemoved = autoContracts.length - dedupedContracts.length;
+  const consumerRemoved =
+    autoContracts.filter((c) => c.role === 'consumer').length -
+    dedupedContracts.filter((c) => c.role === 'consumer').length;
+  const providerRemoved =
+    autoContracts.filter((c) => c.role === 'provider').length -
+    dedupedContracts.filter((c) => c.role === 'provider').length;
   if (consumerRemoved > 0) {
     logger.info(
       `[group/sync] consumer contract dedup: removed ${consumerRemoved} multi-claimant consumers`,
+    );
+  }
+  if (providerRemoved > 0) {
+    logger.info(
+      `[group/sync] provider contract dedup: removed ${providerRemoved} multi-claimant providers`,
     );
   }
 
