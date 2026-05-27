@@ -215,7 +215,7 @@ export class ManifestExtractor {
     // A contractId-based filter passes all of them; dedup by full key removes
     // the extras.
     const seen = new Set<string>();
-    const contracts = contractCandidates
+    const deduped = contractCandidates
       .filter((c) => bestContractIds.has(c.contractId))
       .filter((c) => {
         const key = `${c.contractId}\0${c.type}\0${c.role}\0${c.symbolUid}\0${c.repo}\0${c.symbolRef.filePath}\0${c.symbolName}\0${c.confidence}`;
@@ -223,6 +223,26 @@ export class ManifestExtractor {
         seen.add(key);
         return true;
       });
+
+    // Suppress manifest:: providers that have a resolved counterpart.
+    // When multiple claimants emit the same symbol, one resolves (correct
+    // claimant) and the others get manifest:: UIDs (wrong claimant). The
+    // resolved contract already serves as the provider in cross-links; the
+    // manifest:: version is noise.
+    const resolvedProviderKeys = new Set<string>();
+    for (const c of deduped) {
+      if (c.role === 'provider' && !c.symbolUid.startsWith('manifest::')) {
+        const bareSymbol = c.contractId.split('::').pop() ?? c.contractId;
+        resolvedProviderKeys.add(`${c.repo}\0${c.type}\0${bareSymbol}`);
+      }
+    }
+    const contracts = deduped.filter((c) => {
+      if (c.role === 'provider' && c.symbolUid.startsWith('manifest::')) {
+        const bareSymbol = c.contractId.split('::').pop() ?? c.contractId;
+        return !resolvedProviderKeys.has(`${c.repo}\0${c.type}\0${bareSymbol}`);
+      }
+      return true;
+    });
 
     // Dedup cross-links by (type, fromRepo, toRepo, providerFilePath, providerName, consumerName)
     // — keep the best match. Fix 13: type included so extends cross-links aren't deduped
