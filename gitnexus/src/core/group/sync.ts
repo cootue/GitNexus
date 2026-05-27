@@ -92,11 +92,15 @@ function dedupeMultiClaimantCrossLinks(links: CrossLink[]): CrossLink[] {
     const parts = link.contractId.split('::');
     const type = parts[0];
     const symbol = parts.slice(2).join('::');
-    // Fix: include consumer symbol name so that different ext classes
-    // implementing the same base each produce their own cross-link.
-    // Without this, extends::X::BaseName groups all ext classes together
-    // and keeps only one, losing the others as orphan contracts.
-    const consumerSymName = link.from?.symbolRef?.name || '';
+    // Fix: include consumer symbol name for extends/implements/override
+    // so that different ext classes inheriting the same base each produce
+    // their own cross-link. For other types (custom, xml-ref, etc.) the
+    // consumer symbol name is the claimant artifact key (e.g.
+    // "clm-api::LoginResponse") which varies per claimant — including it
+    // would prevent multi-claimant dedup, causing a 4x explosion in
+    // cross-links.
+    const isExtendsLike = type === 'extends' || type === 'implements' || type === 'override';
+    const consumerSymName = isExtendsLike ? link.from?.symbolRef?.name || '' : '';
     const gk = `${type}\0${symbol}\0${link.from?.repo || ''}\0${consumerSymName}`;
     if (!byKey.has(gk)) byKey.set(gk, []);
     byKey.get(gk)!.push(link);

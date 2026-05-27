@@ -229,17 +229,20 @@ export class ManifestExtractor {
     // claimant) and the others get manifest:: UIDs (wrong claimant). The
     // resolved contract already serves as the provider in cross-links; the
     // manifest:: version is noise.
+    // Cross-repo: a manifest:: provider in repo X for symbol S is noise if
+    // S is resolved in any other repo — the resolved contract in the other
+    // repo is the correct provider for cross-links.
     const resolvedProviderKeys = new Set<string>();
     for (const c of deduped) {
       if (c.role === 'provider' && !c.symbolUid.startsWith('manifest::')) {
         const bareSymbol = c.contractId.split('::').pop() ?? c.contractId;
-        resolvedProviderKeys.add(`${c.repo}\0${c.type}\0${bareSymbol}`);
+        resolvedProviderKeys.add(`${c.type}\0${bareSymbol}`);
       }
     }
     const contracts = deduped.filter((c) => {
       if (c.role === 'provider' && c.symbolUid.startsWith('manifest::')) {
         const bareSymbol = c.contractId.split('::').pop() ?? c.contractId;
-        return !resolvedProviderKeys.has(`${c.repo}\0${c.type}\0${bareSymbol}`);
+        return !resolvedProviderKeys.has(`${c.type}\0${bareSymbol}`);
       }
       return true;
     });
