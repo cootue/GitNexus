@@ -92,7 +92,12 @@ function dedupeMultiClaimantCrossLinks(links: CrossLink[]): CrossLink[] {
     const parts = link.contractId.split('::');
     const type = parts[0];
     const symbol = parts.slice(2).join('::');
-    const gk = `${type}\0${symbol}\0${link.from?.repo || ''}`;
+    // Fix: include consumer symbol name so that different ext classes
+    // implementing the same base each produce their own cross-link.
+    // Without this, extends::X::BaseName groups all ext classes together
+    // and keeps only one, losing the others as orphan contracts.
+    const consumerSymName = link.from?.symbolRef?.name || '';
+    const gk = `${type}\0${symbol}\0${link.from?.repo || ''}\0${consumerSymName}`;
     if (!byKey.has(gk)) byKey.set(gk, []);
     byKey.get(gk)!.push(link);
   }
