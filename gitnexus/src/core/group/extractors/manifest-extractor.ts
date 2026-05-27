@@ -363,21 +363,27 @@ export class ManifestExtractor {
         const symbolName = link.contract.includes('::')
           ? link.contract.split('::').pop()!
           : link.contract;
-        rows = await executor(
-          `MATCH (n:Class|Interface|Method|Function) WHERE n.name = $symbolName
-           RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
-           ORDER BY n.filePath ASC
-           LIMIT 1`,
-          { symbolName },
-        );
+        // Fix 22: FQN disambiguation for custom links. When providerFqn
+        // is available (from consumer's import), constrain the query to
+        // match the correct package path. Prevents name-collision FPs
+        // where multiple classes share the same simple name.
+        const fqnPath = link.providerFqn
+          ? link.providerFqn.replace(/\./g, '/').replace(/\/[^/]*$/, '')
+          : null;
+        rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
+          'Class',
+          'Interface',
+          'Method',
+          'Function',
+        ]);
         if (rows.length === 0) {
-          rows = await executor(
-            `MATCH (n:Enum|Struct|Trait|Constructor|CodeElement) WHERE n.name = $symbolName
-             RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
-             ORDER BY n.filePath ASC
-             LIMIT 1`,
-            { symbolName },
-          );
+          rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
+            'Enum',
+            'Struct',
+            'Trait',
+            'Constructor',
+            'CodeElement',
+          ]);
         }
       } else if (
         link.type === 'extends' ||
@@ -394,21 +400,27 @@ export class ManifestExtractor {
             : link.contract
           : link.extSymbol ||
             (link.contract.includes('::') ? link.contract.split('::').pop()! : link.contract);
-        rows = await executor(
-          `MATCH (n:Class|Interface|Method|Function) WHERE n.name = $symbolName
-           RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
-           ORDER BY n.filePath ASC
-           LIMIT 1`,
-          { symbolName },
-        );
+        // Fix 22: FQN disambiguation for extends/implements/override.
+        // Only applies when resolving the provider side (where name
+        // collisions cause FPs). Consumer side stays simple-name.
+        const fqnPath =
+          isProvider && link.providerFqn
+            ? link.providerFqn.replace(/\./g, '/').replace(/\/[^/]*$/, '')
+            : null;
+        rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
+          'Class',
+          'Interface',
+          'Method',
+          'Function',
+        ]);
         if (rows.length === 0) {
-          rows = await executor(
-            `MATCH (n:Enum|Struct|Trait|Constructor|CodeElement) WHERE n.name = $symbolName
-             RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
-             ORDER BY n.filePath ASC
-             LIMIT 1`,
-            { symbolName },
-          );
+          rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
+            'Enum',
+            'Struct',
+            'Trait',
+            'Constructor',
+            'CodeElement',
+          ]);
         }
       } else if (link.type === 'xml-ref') {
         // Fix 15d: xml-ref consumer side is a resource file (not a graph
@@ -419,31 +431,50 @@ export class ManifestExtractor {
         const symbolName = link.contract.includes('::')
           ? link.contract.split('::').pop()!
           : link.contract;
-        rows = await executor(
-          `MATCH (n:Class|Interface|Method|Function) WHERE n.name = $symbolName
-           RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
-           ORDER BY n.filePath ASC
-           LIMIT 1`,
-          { symbolName },
-        );
+        // Fix 22: FQN disambiguation for xml-ref provider side.
+        const fqnPath = link.providerFqn
+          ? link.providerFqn.replace(/\./g, '/').replace(/\/[^/]*$/, '')
+          : null;
+        rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
+          'Class',
+          'Interface',
+          'Method',
+          'Function',
+        ]);
         if (rows.length === 0) {
-          rows = await executor(
-            `MATCH (n:Enum|Struct|Trait|Constructor|CodeElement) WHERE n.name = $symbolName
-             RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
-             ORDER BY n.filePath ASC
-             LIMIT 1`,
-            { symbolName },
-          );
+          rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
+            'Enum',
+            'Struct',
+            'Trait',
+            'Constructor',
+            'CodeElement',
+          ]);
         }
       } else {
         return null;
       }
       if (rows.length > 0) {
-        return {
+        const resolved = {
           filePath: rows[0].filePath as string,
           name: rows[0].name as string,
           uid: String(rows[0].uid ?? ''),
         };
+        // Fix 22: FQN verification gate (Option C). When providerFqn is
+        // available, verify the resolved node's filePath is consistent with
+        // the expected FQN. If mismatch, the node is a name-collision FP —
+        // return null to prevent an incorrect cross-link.
+        if (link.providerFqn) {
+          const expectedPath = link.providerFqn.replace(/\./g, '/').replace(/\/[^/]*$/, '');
+          const isProviderSide = link.type === 'xml-ref' || repoPathKey === link.from;
+          if (isProviderSide && !resolved.filePath.includes(expectedPath)) {
+            logger.info(
+              `[manifest-extractor] FQN gate rejected ${link.type}:${link.contract} ` +
+                `in ${repoPathKey}: expected path "${expectedPath}" not in "${resolved.filePath}"`,
+            );
+            return null;
+          }
+        }
+        return resolved;
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -453,6 +484,42 @@ export class ManifestExtractor {
       );
     }
     return null;
+  }
+
+  /**
+   * Fix 22: FQN-aware Cypher query with disambiguation and fallback.
+   * When fqnPath is available, first try a constrained query that matches
+   * the expected package path. If that returns 0 results, fall back to
+   * simple-name-only matching (backward compatible). The caller's FQN
+   * verification gate then rejects any name-collision FP from the fallback.
+   */
+  private async queryWithFqnDisambiguation(
+    executor: CypherExecutor,
+    symbolName: string,
+    fqnPath: string | null,
+    labels: string[],
+  ): Promise<Record<string, unknown>[]> {
+    const labelStr = labels.join('|');
+    if (fqnPath) {
+      // Primary: FQN-constrained query for exact package match.
+      const rows = await executor(
+        `MATCH (n:${labelStr}) WHERE n.name = $symbolName AND n.filePath CONTAINS $fqnPath
+         RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+         ORDER BY n.filePath ASC
+         LIMIT 1`,
+        { symbolName, fqnPath },
+      );
+      if (rows.length > 0) return rows;
+      // Fallback: simple-name query when FQN-constrained finds nothing.
+      // The verification gate in resolveSymbol will reject name-collision FPs.
+    }
+    return executor(
+      `MATCH (n:${labelStr}) WHERE n.name = $symbolName
+       RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+       ORDER BY n.filePath ASC
+       LIMIT 1`,
+      { symbolName },
+    );
   }
 
   private buildContractId(type: ContractType, contract: string): string {

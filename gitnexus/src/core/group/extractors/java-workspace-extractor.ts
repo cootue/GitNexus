@@ -19,6 +19,7 @@ interface ImportedSymbol {
   artifactKey: string;
   symbolName: string;
   filePath: string;
+  fqn: string;
 }
 
 interface InheritanceOrOverrideSymbol {
@@ -27,12 +28,14 @@ interface InheritanceOrOverrideSymbol {
   extSymbolName: string;
   filePath: string;
   relType: 'extends' | 'implements' | 'override';
+  baseFqn: string;
 }
 
 interface XmlRefSymbol {
   artifactKey: string;
   symbolName: string;
   filePath: string;
+  fqn: string;
 }
 
 interface PomResult {
@@ -282,6 +285,7 @@ async function scanJavaImports(
                 artifactKey,
                 symbolName: className,
                 filePath: relFile,
+                fqn: fullImport,
               });
             }
           }
@@ -450,6 +454,7 @@ async function scanJavaInheritance(
               extSymbolName: extClassName,
               filePath: relFile,
               relType: 'extends',
+              baseFqn,
             });
           }
         }
@@ -503,6 +508,7 @@ async function scanJavaInheritance(
                 extSymbolName: extClassName,
                 filePath: relFile,
                 relType: 'implements',
+                baseFqn: implFqn,
               });
             }
           }
@@ -552,6 +558,7 @@ async function scanJavaInheritance(
                 extSymbolName: extClassName,
                 filePath: relFile,
                 relType: 'extends',
+                baseFqn,
               });
             }
           }
@@ -688,6 +695,7 @@ async function scanJavaOverride(
               extSymbolName: extShortName,
               filePath: relFile,
               relType: 'override',
+              baseFqn,
             });
           }
         }
@@ -799,6 +807,7 @@ async function scanResourceFqnReferences(
               artifactKey: ak,
               symbolName: className,
               filePath: relFile,
+              fqn,
             });
           }
           break;
@@ -1218,6 +1227,7 @@ export async function extractJavaWorkspaceLinks(
         type: 'custom',
         contract: qualifiedContract,
         role: 'provider' as ContractRole,
+        providerFqn: imp.fqn,
         consumerModuleDir: proj.moduleDir
           ? path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/')
           : null,
@@ -1245,6 +1255,7 @@ export async function extractJavaWorkspaceLinks(
         type: inh.relType,
         contract: qualifiedContract,
         extSymbol: inh.extSymbolName,
+        providerFqn: inh.baseFqn,
         role: 'provider' as ContractRole,
         consumerModuleDir: proj.moduleDir
           ? path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/')
@@ -1272,6 +1283,7 @@ export async function extractJavaWorkspaceLinks(
         type: 'override',
         contract: qualifiedContract,
         extSymbol: ov.extSymbolName,
+        providerFqn: ov.baseFqn,
         role: 'provider' as ContractRole,
         consumerModuleDir: proj.moduleDir
           ? path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/')
@@ -1299,6 +1311,7 @@ export async function extractJavaWorkspaceLinks(
         type: 'xml-ref',
         contract: qualifiedContract,
         consumerFilePath: ref.filePath,
+        providerFqn: ref.fqn,
         role: 'provider' as ContractRole,
         consumerModuleDir: proj.moduleDir
           ? path.relative(proj.repoPath, proj.moduleDir).replace(/\\/g, '/')

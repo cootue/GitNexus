@@ -36,6 +36,13 @@ export interface GroupManifestLink {
   consumerModuleDir?: string | null;
   /** Resource file path for xml-ref links (relative to repo root). */
   consumerFilePath?: string;
+  /**
+   * Fully qualified name of the provider symbol as resolved from the
+   * consumer's import or declaration (e.g. "com.comarch.jext.lang.SystemException").
+   * Used by resolveSymbol() for FQN disambiguation when multiple graph nodes
+   * share the same simple name, preventing name-collision false positives.
+   */
+  providerFqn?: string;
 }
 
 export interface DetectConfig {
