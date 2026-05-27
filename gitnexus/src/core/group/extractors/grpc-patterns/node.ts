@@ -97,6 +97,26 @@ const LOAD_PACKAGE_DEFINITION_SPEC: PatternSpec<Record<string, never>> = {
   `,
 };
 
+// Detect whether the file imports a gRPC package. Real gRPC code always
+// imports from @grpc/grpc-js, @grpc/proto-loader, etc. Webapp JS files
+// (swagger-ui, jquery, handlebars) never import these — they may call
+// loadPackageDefinition for OpenAPI spec loading but are not gRPC consumers.
+// This gate eliminates false positives from the #eq? tree-sitter bug that
+// falsely matches loadPackageDefinition in unrelated files.
+const GRPC_IMPORT_SPEC: PatternSpec<Record<string, never>> = {
+  meta: {},
+  query: `
+    [
+      (import_statement
+        source: [(string) (template_string)] @src (#match? @src "@grpc/"))
+      (call_expression
+        function: (identifier) @req (#eq? @req "require")
+        arguments: (arguments . [(string) (template_string)] @src (#match? @src "@grpc/"))
+      )
+    ]
+  `,
+};
+
 interface NodeGrpcPatternBundle {
   grpcMethod: CompiledPatterns<Record<string, never>>;
   grpcClient: CompiledPatterns<Record<string, never>>;
@@ -104,6 +124,7 @@ interface NodeGrpcPatternBundle {
   newSimpleCtor: CompiledPatterns<Record<string, never>>;
   newQualifiedCtor: CompiledPatterns<Record<string, never>>;
   loadPackageDefinition: CompiledPatterns<Record<string, never>>;
+  grpcImport: CompiledPatterns<Record<string, never>>;
 }
 
 function compileBundle(language: unknown, name: string): NodeGrpcPatternBundle {
@@ -120,6 +141,7 @@ function compileBundle(language: unknown, name: string): NodeGrpcPatternBundle {
     newSimpleCtor: mk(NEW_SIMPLE_CTOR_SPEC, 'new-simple-ctor'),
     newQualifiedCtor: mk(NEW_QUALIFIED_CTOR_SPEC, 'new-qualified-ctor'),
     loadPackageDefinition: mk(LOAD_PACKAGE_DEFINITION_SPEC, 'load-package-definition'),
+    grpcImport: mk(GRPC_IMPORT_SPEC, 'grpc-import'),
   };
 }
 
@@ -270,13 +292,17 @@ function scanBundle(bundle: NodeGrpcPatternBundle, tree: Parser.Tree): GrpcDetec
   }
 
   // ─── Consumer: loadPackageDefinition dynamic proto loader ────────
-  // Only emit when the file uses loadPackageDefinition, otherwise a
-  // generic `new foo.bar.Something()` in unrelated code would falsely
-  // register as a gRPC consumer. Check structurally via a dedicated
-  // query — avoids materializing `tree.rootNode.text` for the whole
-  // file (expensive on large files).
+  // Only emit when BOTH gates are satisfied:
+  //   1. File uses loadPackageDefinition (gRPC dynamic proto loader)
+  //   2. File imports from @grpc/ (proves it's actually gRPC code)
+  // The import gate eliminates false positives from webapp JS files
+  // (swagger-ui, jquery, handlebars) that call loadPackageDefinition
+  // for OpenAPI spec loading but never import gRPC packages.
+  // Also works around the tree-sitter #eq? bug that falsely matches
+  // loadPackageDefinition in files without that identifier.
   const usesLoadPackage = runCompiledPatterns(bundle.loadPackageDefinition, tree).length > 0;
-  if (usesLoadPackage) {
+  const usesGrpcImport = runCompiledPatterns(bundle.grpcImport, tree).length > 0;
+  if (usesLoadPackage && usesGrpcImport) {
     for (const match of runCompiledPatterns(bundle.newQualifiedCtor, tree)) {
       const ctorNode = match.captures.ctor;
       if (!ctorNode) continue;
