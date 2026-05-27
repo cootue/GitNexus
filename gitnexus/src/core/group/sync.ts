@@ -101,7 +101,7 @@ function dedupeMultiClaimantCrossLinks(links: CrossLink[]): CrossLink[] {
     // cross-links.
     const isExtendsLike = type === 'extends' || type === 'implements' || type === 'override';
     const consumerSymName = isExtendsLike ? link.from?.symbolRef?.name || '' : '';
-    const gk = `${type}\0${symbol}\0${link.from?.repo || ''}\0${consumerSymName}`;
+    const gk = `${type}\0${symbol}\0${link.from?.repo || ''}\0${link.to?.repo || ''}\0${consumerSymName}`;
     if (!byKey.has(gk)) byKey.set(gk, []);
     byKey.get(gk)!.push(link);
   }
