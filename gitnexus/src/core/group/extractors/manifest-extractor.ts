@@ -208,7 +208,21 @@ export class ManifestExtractor {
       if (c.role === 'consumer') bestContractIds.add(c.contractId);
     }
 
-    const contracts = contractCandidates.filter((c) => bestContractIds.has(c.contractId));
+    // Filter by surviving contractIds, then remove exact duplicates.
+    // bestContractIds keeps one contractId per provider group, but multiple
+    // contract candidates can share the same contractId (e.g. 96 xml-ref
+    // provider contracts all with contractId "xml-ref::ca-jext-lib::HeaderData").
+    // A contractId-based filter passes all of them; dedup by full key removes
+    // the extras.
+    const seen = new Set<string>();
+    const contracts = contractCandidates
+      .filter((c) => bestContractIds.has(c.contractId))
+      .filter((c) => {
+        const key = `${c.contractId}\0${c.type}\0${c.role}\0${c.symbolUid}\0${c.repo}\0${c.symbolRef.filePath}\0${c.symbolName}\0${c.confidence}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
 
     // Dedup cross-links by (type, fromRepo, toRepo, providerFilePath, providerName, consumerName)
     // — keep the best match. Fix 13: type included so extends cross-links aren't deduped
