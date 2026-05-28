@@ -209,6 +209,12 @@ interface RepoHandle {
   lastCommit: string;
   remoteUrl?: string;
   stats?: RegistryEntry['stats'];
+  vectorSearch?: {
+    provider?: string;
+    status?: string;
+    exactScanLimit?: number;
+    reason?: string;
+  };
 }
 
 export class LocalBackend {
@@ -232,7 +238,13 @@ export class LocalBackend {
    * platforms where the extension is unsupported (e.g. Windows), making MCP
    * stderr noisy per DoD §2.8.
    */
-  private warnedVectorUnsupported = false;
+  private warnedVectorFallbacks: Set<string> = new Set();
+
+  private warnVectorFallbackOnce(key: string, message: string): void {
+    if (this.warnedVectorFallbacks.has(key)) return;
+    this.warnedVectorFallbacks.add(key);
+    logger.warn(message);
+  }
 
   /**
    * Cross-repo group tools (CLI). Shares logic with MCP `group_*` handlers.
@@ -282,6 +294,16 @@ export class LocalBackend {
 
       const storagePath = entry.storagePath;
       const lbugPath = path.join(storagePath, 'lbug');
+      let vectorSearch: RepoHandle['vectorSearch'];
+      try {
+        const metaRaw = await fs.readFile(path.join(storagePath, 'meta.json'), 'utf-8');
+        const meta = JSON.parse(metaRaw) as {
+          capabilities?: { vectorSearch?: RepoHandle['vectorSearch'] };
+        };
+        vectorSearch = meta.capabilities?.vectorSearch;
+      } catch {
+        vectorSearch = undefined;
+      }
 
       // Clean up any leftover KuzuDB files from before the LadybugDB migration.
       // If kuzu exists but lbug doesn't, warn so the user knows to re-analyze.
@@ -302,6 +324,7 @@ export class LocalBackend {
         lastCommit: entry.lastCommit,
         remoteUrl: entry.remoteUrl,
         stats: entry.stats,
+        vectorSearch,
       };
 
       this.repos.set(id, handle);
@@ -1108,7 +1131,11 @@ export class LocalBackend {
         string,
         { distance: number; chunkIndex: number; startLine: number; endLine: number }
       >();
-      if (isVectorExtensionSupportedByPlatform()) {
+      const repoVectorStatus = repo.vectorSearch?.status;
+      const shouldTryVector =
+        repoVectorStatus === 'vector-index' ||
+        (repoVectorStatus === undefined && isVectorExtensionSupportedByPlatform());
+      if (shouldTryVector) {
         try {
           bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
             const vectorQuery = `
@@ -1131,23 +1158,29 @@ export class LocalBackend {
               distance: row.distance ?? row[4],
             }));
           });
-        } catch {
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.warnVectorFallbackOnce(
+            `${repo.id}|vector-query-failed`,
+            `GitNexus [query:vector]: VECTOR query failed for repo "${repo.name}"; using exact scan fallback. ${msg}`,
+          );
           bestChunks = new Map();
         }
-      } else if (!this.warnedVectorUnsupported) {
-        // Rare diagnostic: surface why we fell back to the exact scan path so
-        // operators can see at a glance that VECTOR is disabled by platform
-        // policy. Emitted once per `LocalBackend` instance lifetime to avoid
-        // noisy stderr on hot semantic-search paths (DoD §2.8).
-        this.warnedVectorUnsupported = true;
-        logger.warn(
-          'GitNexus [query:vector]: VECTOR extension not supported on this platform; using exact scan fallback',
+      } else {
+        const fallbackReason =
+          repo.vectorSearch?.reason ??
+          (repoVectorStatus === undefined
+            ? 'VECTOR extension not supported on this platform'
+            : `repo capabilities report ${repoVectorStatus}`);
+        this.warnVectorFallbackOnce(
+          `${repo.id}|vector-unavailable|${fallbackReason}`,
+          `GitNexus [query:vector]: VECTOR index unavailable for repo "${repo.name}"; using exact scan fallback. ${fallbackReason}`,
         );
       }
 
       if (bestChunks.size === 0) {
         const embeddingCount = Number(tableCheck[0].cnt ?? tableCheck[0][0] ?? 0);
-        const exactLimit = getExactScanLimit();
+        const exactLimit = repo.vectorSearch?.exactScanLimit ?? getExactScanLimit();
         if (embeddingCount > exactLimit) return [];
 
         const rows = await executeQuery(

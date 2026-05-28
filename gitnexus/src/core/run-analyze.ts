@@ -710,10 +710,8 @@ export async function runFullAnalysis(
       );
       if (embeddingResult.semanticMode === 'exact-scan') {
         semanticMode = 'exact-scan';
-        log(
-          'Semantic embeddings were generated without a VECTOR index; ' +
-            'queries will use exact-scan fallback within the configured limit.',
-        );
+        const { getVectorExactScanReason } = await import('./platform/capabilities.js');
+        log(getVectorExactScanReason());
       } else {
         semanticMode = 'vector-index';
       }
@@ -741,11 +739,16 @@ export async function runFullAnalysis(
       );
     }
 
-    const { getRuntimeCapabilities } = await import('./platform/capabilities.js');
+    const { getRuntimeCapabilities, getVectorExactScanReason } =
+      await import('./platform/capabilities.js');
     const runtimeCapabilities = getRuntimeCapabilities();
     const effectiveSemanticMode =
       semanticMode ??
       (runtimeCapabilities.semanticMode === 'vector-index' ? 'vector-index' : 'exact-scan');
+    const vectorSearchReason =
+      embeddingCount > 0 && effectiveSemanticMode === 'exact-scan'
+        ? getVectorExactScanReason()
+        : runtimeCapabilities.reason;
 
     // Convert the post-run file-hash map to the on-disk Record<string,string>
     // shape consumed by RepoMeta.fileHashes.
@@ -778,7 +781,7 @@ export async function runFullAnalysis(
           provider: effectiveSemanticMode === 'vector-index' ? 'ladybugdb-vector' : 'exact-scan',
           status: embeddingCount > 0 ? effectiveSemanticMode : 'unavailable',
           exactScanLimit: runtimeCapabilities.exactScanLimit,
-          reason: runtimeCapabilities.reason,
+          reason: vectorSearchReason,
         },
       },
       // Incremental-indexing fields. Populated for git repos so the next

@@ -82,6 +82,7 @@ program
       '  GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=N  Worker idle timeout in milliseconds. Default 30000.\n' +
       '  GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES=N  Worker job byte budget. Default 8388608.\n' +
       '  GITNEXUS_EMBEDDING_THREADS=N  Limit local ONNX CPU threads for --embeddings.\n' +
+      '  GITNEXUS_DISABLE_VECTOR_WIN32=1  Force exact-scan fallback on Windows (disable experimental VECTOR probing).\n' +
       '  GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT=N  Max embedding chunks for exact-scan fallback. Default 10000.\n' +
       '\nTip: `.gitnexusignore` supports `.gitignore`-style negation. Add e.g.\n' +
       '     `!__tests__/` to index a directory that is auto-filtered by default (#771).',

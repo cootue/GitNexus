@@ -257,10 +257,40 @@ describe('LocalBackend.callTool', () => {
         cap
           .records()
           .some((r) =>
-            String(r.msg ?? '').includes(
-              'GitNexus [query:vector]: VECTOR extension not supported on this platform',
-            ),
+            String(r.msg ?? '').includes('VECTOR extension not supported on this platform'),
           ),
+      ).toBe(true);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('skips vector index query when repo capabilities report exact-scan fallback', async () => {
+    const cap = _captureLogger();
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    ((backend as any).repos.values().next().value as any).vectorSearch = {
+      status: 'exact-scan',
+      reason: 'repo indexed without a VECTOR index',
+      exactScanLimit: 10_000,
+    };
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
+      if (cypher.includes('MATCH (e:CodeEmbedding)')) return [];
+      return [];
+    });
+    (executeParameterized as any).mockResolvedValue([]);
+
+    try {
+      await backend.callTool('query', { query: 'auth' });
+
+      const queries = (executeQuery as any).mock.calls.map(
+        ([, cypher]: [string, string]) => cypher,
+      );
+      expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(false);
+      expect(
+        cap
+          .records()
+          .some((r) => String(r.msg ?? '').includes('repo indexed without a VECTOR index')),
       ).toBe(true);
     } finally {
       cap.restore();
@@ -269,6 +299,24 @@ describe('LocalBackend.callTool', () => {
 
   it('issues vector index query when VECTOR is supported by the platform', async () => {
     platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
+      return [];
+    });
+    (executeParameterized as any).mockResolvedValue([]);
+
+    await backend.callTool('query', { query: 'auth' });
+
+    const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
+    expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(true);
+  });
+
+  it('issues vector index query when repo capabilities report vector-index on Windows', async () => {
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(false);
+    ((backend as any).repos.values().next().value as any).vectorSearch = {
+      status: 'vector-index',
+      reason: 'Windows VECTOR probe succeeded during analyze',
+    };
     (executeQuery as any).mockImplementation(async (_repoId: string, cypher: string) => {
       if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
       return [];

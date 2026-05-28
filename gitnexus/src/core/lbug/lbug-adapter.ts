@@ -16,7 +16,14 @@ import {
 } from './schema.js';
 import { streamAllCSVsToDisk } from './csv-generator.js';
 import type { CachedEmbedding } from '../embeddings/types.js';
-import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
+import {
+  extensionManager,
+  getExtensionInstallTimeoutMs,
+  installDuckDbExtensionOutOfProcess,
+  probeDuckDbExtensionLoadOutOfProcess,
+  resolveExtensionInstallPolicy,
+  type ExtensionEnsureOptions,
+} from './extension-loader.js';
 import {
   closeLbugConnection,
   isDbBusyError,
@@ -154,6 +161,7 @@ let conn: lbug.Connection | null = null;
 let currentDbPath: string | null = null;
 let ftsLoaded = false;
 let vectorExtensionLoaded = false;
+const warnedVectorUnavailableReasons = new Set<string>();
 
 /**
  * In-process cache of FTS indexes observed against the current singleton
@@ -215,6 +223,14 @@ const MAX_LOGGED_ERROR_MESSAGE_LENGTH = 160;
 
 const summarizeError = (err: unknown): string =>
   (err instanceof Error ? err.message : String(err)).slice(0, MAX_LOGGED_ERROR_MESSAGE_LENGTH);
+
+const warnVectorUnavailableOnce = (reason: string): void => {
+  if (warnedVectorUnavailableReasons.has(reason)) return;
+  warnedVectorUnavailableReasons.add(reason);
+  logger.warn(
+    `GitNexus: VECTOR extension unavailable; continuing without VECTOR features. ${reason}`,
+  );
+};
 
 // ---------------------------------------------------------------------------
 // Cross-process init lock
@@ -1583,13 +1599,6 @@ export const loadVectorExtension = async (
 ): Promise<boolean> => {
   const useModuleState = targetConn === undefined;
   if (useModuleState && vectorExtensionLoaded) return true;
-  // INSTALL VECTOR crashes with SIGSEGV on Windows: the KuzuDB native extension
-  // installer has an unhandled error path on Windows that raises a fatal signal
-  // that JS try/catch cannot intercept. Skip loading — vector/embedding search
-  // is unavailable but all graph index queries still work. Do NOT set
-  // vectorExtensionLoaded here: the flag means "successfully loaded", and a
-  // subsequent call would otherwise short-circuit to `return true` at the top.
-  if (process.platform === 'win32') return false;
   if (!isVectorExtensionSupportedByPlatform()) return false;
 
   const c: lbug.Connection | null = targetConn ?? conn;
@@ -1597,12 +1606,55 @@ export const loadVectorExtension = async (
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
 
-  const loaded = await extensionManager.ensure(
-    (sql) => queryAndDrain(c, sql),
-    'VECTOR',
-    'VECTOR',
-    opts,
-  );
+  let loaded: boolean;
+  if (process.platform === 'win32') {
+    const policy = resolveExtensionInstallPolicy(opts.policy);
+    if (policy === 'never') {
+      warnVectorUnavailableOnce('extension install policy is "never"');
+      return false;
+    }
+
+    const timeoutMs = opts.installTimeoutMs ?? getExtensionInstallTimeoutMs();
+    const query = (sql: string) => queryAndDrain(c, sql);
+    const probeReason = (message: string): string =>
+      `Windows VECTOR probe failed before in-process LOAD EXTENSION VECTOR: ${message}`;
+
+    let probe = await probeDuckDbExtensionLoadOutOfProcess('VECTOR', timeoutMs);
+    if (!probe.success) {
+      if (policy === 'load-only') {
+        warnVectorUnavailableOnce(probeReason(probe.message));
+        return false;
+      }
+
+      const install = await installDuckDbExtensionOutOfProcess('VECTOR', timeoutMs);
+      if (!install.success) {
+        warnVectorUnavailableOnce(install.message);
+        return false;
+      }
+
+      probe = await probeDuckDbExtensionLoadOutOfProcess('VECTOR', timeoutMs);
+      if (!probe.success) {
+        warnVectorUnavailableOnce(probeReason(probe.message));
+        return false;
+      }
+    }
+
+    // Even with a successful child-process probe, the actual connection still
+    // needs a real LOAD EXTENSION VECTOR call. Keep that load-only so the risky
+    // install step never runs in-process on Windows.
+    loaded = await extensionManager.ensure(query, 'VECTOR', 'VECTOR', {
+      ...opts,
+      policy: 'load-only',
+      installTimeoutMs: timeoutMs,
+    });
+  } else {
+    loaded = await extensionManager.ensure(
+      (sql) => queryAndDrain(c, sql),
+      'VECTOR',
+      'VECTOR',
+      opts,
+    );
+  }
   if (loaded && useModuleState) vectorExtensionLoaded = true;
   return loaded;
 };

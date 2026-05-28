@@ -99,6 +99,22 @@ export interface RepoMeta {
     /** Number of files in the writable set, for diagnostic logs. */
     toWriteCount: number;
   };
+  capabilities?: {
+    graph?: {
+      provider?: string;
+      status?: string;
+    };
+    fts?: {
+      provider?: string;
+      status?: string;
+    };
+    vectorSearch?: {
+      provider?: string;
+      status?: string;
+      exactScanLimit?: number;
+      reason?: string;
+    };
+  };
 }
 
 /**

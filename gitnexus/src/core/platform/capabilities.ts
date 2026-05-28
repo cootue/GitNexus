@@ -24,6 +24,8 @@ export interface RuntimeCapabilities {
   reason?: string;
 }
 
+export const WIN32_VECTOR_DISABLE_ENV = 'GITNEXUS_DISABLE_VECTOR_WIN32';
+
 const packageVersion = (name: string): string | undefined => {
   try {
     return require(`${name}/package.json`).version;
@@ -46,6 +48,8 @@ const parsePositiveInt = (value: string | undefined, fallback: number): number =
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+const isTruthyFlag = (value: string | undefined): boolean => /^(1|true|yes|on)$/i.test(value ?? '');
+
 export const DEFAULT_EXACT_SCAN_LIMIT = 10_000;
 
 export const getExactScanLimit = (): number =>
@@ -60,12 +64,49 @@ export const getRuntimeFingerprint = (): RuntimeFingerprint => ({
   onnxruntime: packageVersion('onnxruntime-node'),
 });
 
+export const isWin32VectorRolloutEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  !isTruthyFlag(env[WIN32_VECTOR_DISABLE_ENV]);
+
+export const getVectorPlatformReason = (
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined => {
+  if (platform !== 'win32') return undefined;
+  if (!isWin32VectorRolloutEnabled(env)) {
+    return (
+      `LadybugDB VECTOR on Windows was disabled via ${WIN32_VECTOR_DISABLE_ENV}=1. ` +
+      'Semantic search uses exact scan when embeddings exist.'
+    );
+  }
+  if (isWin32VectorRolloutEnabled(env)) {
+    return (
+      'LadybugDB VECTOR on Windows is enabled by default. ' +
+      `set ${WIN32_VECTOR_DISABLE_ENV}=1 to force exact scan fallback.`
+    );
+  }
+  return undefined;
+};
+
+export const getVectorExactScanReason = (
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string =>
+  platform === 'win32'
+    ? isWin32VectorRolloutEnabled(env)
+      ? 'LadybugDB VECTOR could not be verified on this Windows runtime; semantic search uses exact scan when embeddings exist.'
+      : `LadybugDB VECTOR on Windows was disabled via ${WIN32_VECTOR_DISABLE_ENV}=1. Semantic search uses exact scan when embeddings exist.`
+    : 'Semantic embeddings were generated without a VECTOR index; queries will use exact scan fallback within the configured limit.';
+
 export const isVectorExtensionSupportedByPlatform = (
   platform: NodeJS.Platform = process.platform,
-): boolean => platform !== 'win32';
+  env: NodeJS.ProcessEnv = process.env,
+): boolean => platform !== 'win32' || isWin32VectorRolloutEnabled(env);
 
-export const getRuntimeCapabilities = (): RuntimeCapabilities => {
-  const vector = isVectorExtensionSupportedByPlatform() ? 'available' : 'unavailable';
+export const getRuntimeCapabilities = (
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): RuntimeCapabilities => {
+  const vector = isVectorExtensionSupportedByPlatform(platform, env) ? 'available' : 'unavailable';
   const exactScanLimit = getExactScanLimit();
   return {
     graph: 'available',
@@ -73,10 +114,7 @@ export const getRuntimeCapabilities = (): RuntimeCapabilities => {
     vector,
     semanticMode: vector === 'available' ? 'vector-index' : 'exact-scan',
     exactScanLimit,
-    reason:
-      vector === 'unavailable'
-        ? 'LadybugDB VECTOR is disabled on this platform; semantic search uses exact scan when embeddings exist.'
-        : undefined,
+    reason: getVectorPlatformReason(platform, env),
   };
 };
 

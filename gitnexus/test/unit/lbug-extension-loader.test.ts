@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   ExtensionManager,
   getExtensionInstallChildProcessArgs,
+  getExtensionLoadProbeChildProcessArgs,
   getExtensionInstallTimeoutMs,
   type ExtensionInstallResult,
 } from '../../src/core/lbug/extension-loader.js';
@@ -219,6 +220,17 @@ describe('installDuckDbExtensionOutOfProcess child process', () => {
 
   it('passes the resolved LadybugDB max DB size to the installer child', () => {
     expect(getExtensionInstallChildProcessArgs('fts', 1234).at(-1)).toBe('1234');
+  });
+
+  it('spawns the stable packaged load-probe script instead of inline -e code', () => {
+    const args = getExtensionLoadProbeChildProcessArgs('VECTOR');
+
+    expect(args).not.toContain('-e');
+    expect(args).not.toContain('--input-type=module');
+    expect(args[0]).toContain('scripts');
+    expect(args[0]).toContain('probe-duckdb-extension-load.mjs');
+    expect(args[1]).toBe('VECTOR');
+    expect(Number(args[2])).toBeGreaterThan(0);
   });
 });
 

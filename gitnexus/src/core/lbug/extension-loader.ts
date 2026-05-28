@@ -5,6 +5,7 @@ import { logger } from '../logger.js';
 
 const DEFAULT_EXTENSION_INSTALL_TIMEOUT_MS = 15_000;
 const EXTENSION_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
+type ExtensionChildProcessMode = 'install' | 'probe-load';
 
 /**
  * Lifecycle policy for an optional DuckDB extension.
@@ -56,19 +57,36 @@ const resolvePolicyFromEnv = (): ExtensionInstallPolicy => {
   return 'auto';
 };
 
+export const resolveExtensionInstallPolicy = (
+  override?: ExtensionInstallPolicy,
+): ExtensionInstallPolicy => override ?? resolvePolicyFromEnv();
+
 export const getExtensionInstallTimeoutMs = (): number => {
   const raw = process.env.GITNEXUS_LBUG_EXTENSION_INSTALL_TIMEOUT_MS;
   const parsed = raw ? Number(raw) : NaN;
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_EXTENSION_INSTALL_TIMEOUT_MS;
 };
 
-export const getExtensionInstallChildProcessArgs = (
+const getExtensionChildProcessArgs = (
+  mode: ExtensionChildProcessMode,
   extensionName: string,
   maxDbSize: number = LBUG_MAX_DB_SIZE,
 ): string[] => {
-  const childScript = new URL('../../../scripts/install-duckdb-extension.mjs', import.meta.url);
+  const scriptName =
+    mode === 'install' ? 'install-duckdb-extension.mjs' : 'probe-duckdb-extension-load.mjs';
+  const childScript = new URL(`../../../scripts/${scriptName}`, import.meta.url);
   return [fileURLToPath(childScript), extensionName, String(maxDbSize)];
 };
+
+export const getExtensionInstallChildProcessArgs = (
+  extensionName: string,
+  maxDbSize: number = LBUG_MAX_DB_SIZE,
+): string[] => getExtensionChildProcessArgs('install', extensionName, maxDbSize);
+
+export const getExtensionLoadProbeChildProcessArgs = (
+  extensionName: string,
+  maxDbSize: number = LBUG_MAX_DB_SIZE,
+): string[] => getExtensionChildProcessArgs('probe-load', extensionName, maxDbSize);
 
 /**
  * Run `INSTALL <extension>` in a short-lived child Node process so the parent
@@ -78,7 +96,8 @@ export const getExtensionInstallChildProcessArgs = (
  * If the child exceeds `timeoutMs` the parent kills it with SIGKILL and
  * resolves with `timedOut: true`.
  */
-export const installDuckDbExtensionOutOfProcess = async (
+const runDuckDbExtensionChildProcess = async (
+  mode: ExtensionChildProcessMode,
   extensionName: string,
   timeoutMs: number = getExtensionInstallTimeoutMs(),
 ): Promise<ExtensionInstallResult> => {
@@ -86,8 +105,11 @@ export const installDuckDbExtensionOutOfProcess = async (
     throw new Error(`Invalid DuckDB extension name: ${extensionName}`);
   }
 
+  const operation = mode === 'install' ? 'INSTALL' : 'LOAD';
+  const childArgs = getExtensionChildProcessArgs(mode, extensionName);
+
   return await new Promise<ExtensionInstallResult>((resolve) => {
-    const child = spawn(process.execPath, getExtensionInstallChildProcessArgs(extensionName), {
+    const child = spawn(process.execPath, childArgs, {
       env: {
         ...process.env,
         GITNEXUS_LBUG_EXTENSION_NAME: extensionName,
@@ -110,7 +132,7 @@ export const installDuckDbExtensionOutOfProcess = async (
       resolve({
         success: false,
         timedOut: true,
-        message: `INSTALL ${extensionName} timed out after ${timeoutMs}ms`,
+        message: `${operation} ${extensionName} timed out after ${timeoutMs}ms`,
       });
     }, timeoutMs);
 
@@ -130,12 +152,24 @@ export const installDuckDbExtensionOutOfProcess = async (
         timedOut: false,
         message:
           code === 0
-            ? `INSTALL ${extensionName} completed`
-            : `INSTALL ${extensionName} failed with ${signal ?? `exit code ${code}`}${stderr ? `: ${stderr.trim()}` : ''}`,
+            ? `${operation} ${extensionName} completed`
+            : `${operation} ${extensionName} failed with ${signal ?? `exit code ${code}`}${stderr ? `: ${stderr.trim()}` : ''}`,
       });
     });
   });
 };
+
+export const installDuckDbExtensionOutOfProcess = async (
+  extensionName: string,
+  timeoutMs: number = getExtensionInstallTimeoutMs(),
+): Promise<ExtensionInstallResult> =>
+  runDuckDbExtensionChildProcess('install', extensionName, timeoutMs);
+
+export const probeDuckDbExtensionLoadOutOfProcess = async (
+  extensionName: string,
+  timeoutMs: number = getExtensionInstallTimeoutMs(),
+): Promise<ExtensionInstallResult> =>
+  runDuckDbExtensionChildProcess('probe-load', extensionName, timeoutMs);
 
 /**
  * Centralized lifecycle manager for optional LadybugDB extensions.
@@ -186,7 +220,7 @@ export class ExtensionManager {
       throw new Error(`Invalid DuckDB extension name: ${name}`);
     }
 
-    const policy = opts.policy ?? this.options.policy ?? resolvePolicyFromEnv();
+    const policy = resolveExtensionInstallPolicy(opts.policy ?? this.options.policy);
     const timeoutMs =
       opts.installTimeoutMs ?? this.options.installTimeoutMs ?? getExtensionInstallTimeoutMs();
     const warn = this.options.warn ?? ((msg: string) => logger.warn(msg));
