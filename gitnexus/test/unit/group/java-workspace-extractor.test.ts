@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { extractJavaWorkspaceLinks } from '../../../src/core/group/extractors/java-workspace-extractor.js';
+import { _captureLogger } from '../../../src/core/logger.js';
 
 describe('JavaWorkspaceExtractor', () => {
   let tmpDir: string;
@@ -30,6 +31,11 @@ describe('JavaWorkspaceExtractor', () => {
       .join('\n');
     return `<project><groupId>${g}</groupId><artifactId>${a}</artifactId><dependencies>${depXml}</dependencies></project>`;
   };
+
+  const aggregatorPomTemplate = (g: string, a: string, modules: string[]) =>
+    `<project><groupId>${g}</groupId><artifactId>${a}</artifactId><modules>${modules
+      .map((m) => `<module>${m}</module>`)
+      .join('')}</modules></project>`;
 
   it('discovers cross-project imports via Maven pom.xml', async () => {
     await writeFile('models/pom.xml', pomTemplate('com.acme', 'models'));
@@ -236,5 +242,71 @@ describe('JavaWorkspaceExtractor', () => {
     expect(result.links).toHaveLength(2);
     const contracts = result.links.map((l) => l.contract).sort();
     expect(contracts).toEqual(['lib::Request', 'lib::Response']);
+  });
+
+  it('suppresses Java workspace discovery info logs by default', async () => {
+    await writeFile('suite/pom.xml', aggregatorPomTemplate('com.acme', 'suite', ['lib', 'app']));
+    await writeFile('suite/lib/pom.xml', pomTemplate('com.acme', 'lib'));
+    await writeFile(
+      'suite/lib/src/main/java/com/acme/lib/Shared.java',
+      'package com.acme.lib;\npublic class Shared {}\n',
+    );
+    await writeFile('suite/app/pom.xml', pomTemplate('com.acme', 'app', ['com.acme:lib']));
+    await writeFile(
+      'suite/app/src/main/java/com/acme/app/Main.java',
+      'package com.acme.app;\nimport com.acme.lib.Shared;\npublic class Main {}\n',
+    );
+
+    const repos = { suite: 'suite' };
+    const repoPaths = new Map([['suite', path.join(tmpDir, 'suite')]]);
+
+    const cap = _captureLogger();
+    try {
+      const result = await extractJavaWorkspaceLinks(repos, repoPaths);
+
+      expect(result.discoveredProjects.size).toBeGreaterThan(0);
+      expect(
+        cap.records().some((r) => String(r.msg ?? '').includes('[java-workspace-extractor]')),
+      ).toBe(false);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('emits Java workspace discovery info logs when verbose is enabled', async () => {
+    await writeFile('suite/pom.xml', aggregatorPomTemplate('com.acme', 'suite', ['lib', 'app']));
+    await writeFile('suite/lib/pom.xml', pomTemplate('com.acme', 'lib'));
+    await writeFile(
+      'suite/lib/src/main/java/com/acme/lib/Shared.java',
+      'package com.acme.lib;\npublic class Shared {}\n',
+    );
+    await writeFile('suite/app/pom.xml', pomTemplate('com.acme', 'app', ['com.acme:lib']));
+    await writeFile(
+      'suite/app/src/main/java/com/acme/app/Main.java',
+      'package com.acme.app;\nimport com.acme.lib.Shared;\npublic class Main {}\n',
+    );
+
+    const repos = { suite: 'suite' };
+    const repoPaths = new Map([['suite', path.join(tmpDir, 'suite')]]);
+
+    const cap = _captureLogger();
+    try {
+      const result = await extractJavaWorkspaceLinks(repos, repoPaths, undefined, undefined, {
+        verbose: true,
+      });
+
+      expect(result.discoveredProjects.size).toBeGreaterThan(0);
+      const messages = cap.records().map((r) => String(r.msg ?? ''));
+      expect(messages.some((msg) => msg.includes('[java-workspace-extractor] manifest:'))).toBe(
+        true,
+      );
+      expect(
+        messages.some(
+          (msg) => msg.includes('[java-workspace-extractor]') && msg.includes('exports packages:'),
+        ),
+      ).toBe(true);
+    } finally {
+      cap.restore();
+    }
   });
 });

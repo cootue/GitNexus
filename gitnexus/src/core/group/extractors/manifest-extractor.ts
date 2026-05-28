@@ -8,6 +8,10 @@ export interface ManifestExtractResult {
   crossLinks: CrossLink[];
 }
 
+interface ManifestExtractorOptions {
+  verbose?: boolean;
+}
+
 function normalizeRoutePath(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '/';
@@ -28,6 +32,8 @@ export function manifestSymbolUid(repo: string, contractId: string): string {
 }
 
 export class ManifestExtractor {
+  constructor(private readonly options: ManifestExtractorOptions = {}) {}
+
   async extractFromManifest(
     links: GroupManifestLink[],
     dbExecutors?: Map<string, CypherExecutor>,
@@ -467,10 +473,12 @@ export class ManifestExtractor {
           const expectedPath = link.providerFqn.replace(/\./g, '/').replace(/\/[^/]*$/, '');
           const isProviderSide = link.type === 'xml-ref' || repoPathKey === link.from;
           if (isProviderSide && !resolved.filePath.includes(expectedPath)) {
-            logger.info(
-              `[manifest-extractor] FQN gate rejected ${link.type}:${link.contract} ` +
-                `in ${repoPathKey}: expected path "${expectedPath}" not in "${resolved.filePath}"`,
-            );
+            if (this.options.verbose) {
+              logger.info(
+                `[manifest-extractor] FQN gate rejected ${link.type}:${link.contract} ` +
+                  `in ${repoPathKey}: expected path "${expectedPath}" not in "${resolved.filePath}"`,
+              );
+            }
             return null;
           }
         }

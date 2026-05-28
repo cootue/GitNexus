@@ -23,6 +23,7 @@ export async function discoverWorkspaceLinks(
   repoPaths: Map<string, string>,
   dbExecutors?: Map<string, CypherExecutor>,
   matchingConfig?: MatchingConfig,
+  verbose: boolean = false,
 ): Promise<WorkspaceDiscoveryResult> {
   const links: GroupManifestLink[] = [];
   const stats: WorkspaceExtractorStats[] = [];
@@ -67,7 +68,13 @@ export async function discoverWorkspaceLinks(
     });
   }
 
-  const javaResult = await extractJavaWorkspaceLinks(repos, repoPaths, dbExecutors, matchingConfig);
+  const javaResult = await extractJavaWorkspaceLinks(
+    repos,
+    repoPaths,
+    dbExecutors,
+    matchingConfig,
+    { verbose },
+  );
   if (javaResult.links.length > 0) {
     links.push(...javaResult.links);
     stats.push({

@@ -277,6 +277,7 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
           repoPaths,
           dbExecutors,
           config.matching,
+          Boolean(opts?.verbose),
         );
         if (wsResult.links.length > 0) {
           allLinks = [...allLinks, ...wsResult.links];
@@ -305,7 +306,7 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
           }
         }
 
-        const manifestEx = new ManifestExtractor();
+        const manifestEx = new ManifestExtractor({ verbose: Boolean(opts?.verbose) });
         const manifestResult = await manifestEx.extractFromManifest(allLinks, dbExecutors);
         autoContracts.push(...manifestResult.contracts);
         manifestCrossLinks = manifestResult.crossLinks;

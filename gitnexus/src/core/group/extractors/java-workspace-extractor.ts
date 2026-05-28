@@ -45,6 +45,14 @@ interface PomResult {
   modules: string[];
 }
 
+interface JavaWorkspaceExtractorOptions {
+  verbose?: boolean;
+}
+
+function logVerboseDiscovery(verbose: boolean, message: string): void {
+  if (verbose) logger.info(message);
+}
+
 async function parseJavaManifest(
   repoPath: string,
 ): Promise<(PomResult & { pomPath: string }) | null> {
@@ -864,6 +872,7 @@ async function scanRepoMavenProjects(
   projectsByKey: Map<string, JavaProjectMeta>,
   moduleDirToKey: Map<string, string>,
   projectsByGroupPath: Map<string, JavaProjectMeta>,
+  verbose: boolean,
 ): Promise<boolean> {
   interface PomCandidate extends PomResult {
     pomDir: string;
@@ -939,7 +948,8 @@ async function scanRepoMavenProjects(
   };
   projectsByKey.set(manifestKey, meta);
   projectsByGroupPath.set(groupPath, meta);
-  logger.info(
+  logVerboseDiscovery(
+    verbose,
     `[java-workspace-extractor] manifest: ${manifestKey} in ${groupPath} (${aggregators.length} aggregators, ${leaves.length} leaves, ${candidates.length} total candidates)`,
   );
 
@@ -958,7 +968,8 @@ async function scanRepoMavenProjects(
         };
         projectsByKey.set(aggKey, aggMeta);
         moduleDirToKey.set(agg.pomDir, aggKey);
-        logger.info(
+        logVerboseDiscovery(
+          verbose,
           `[java-workspace-extractor] aggregator: ${aggKey} in ${groupPath} (${agg.modules.length} modules)`,
         );
       } else if (!projectsByKey.get(aggKey)!.moduleDir) {
@@ -1002,7 +1013,8 @@ async function scanRepoMavenProjects(
             };
             projectsByKey.set(moduleKey, moduleMeta);
             moduleDirToKey.set(moduleDir, moduleKey);
-            logger.info(
+            logVerboseDiscovery(
+              verbose,
               `[java-workspace-extractor] module: ${moduleKey} in ${groupPath} (depth ${depth + 1})`,
             );
           } else if (!projectsByKey.get(moduleKey)!.moduleDir) {
@@ -1035,7 +1047,7 @@ async function scanRepoMavenProjects(
       };
       projectsByKey.set(leafKey, leafMeta);
       moduleDirToKey.set(leaf.pomDir, leafKey);
-      logger.info(`[java-workspace-extractor] leaf: ${leafKey} in ${groupPath}`);
+      logVerboseDiscovery(verbose, `[java-workspace-extractor] leaf: ${leafKey} in ${groupPath}`);
     } else if (!projectsByKey.get(leafKey)!.moduleDir) {
       projectsByKey.get(leafKey)!.moduleDir = leaf.pomDir;
       moduleDirToKey.set(leaf.pomDir, leafKey);
@@ -1055,7 +1067,9 @@ export async function extractJavaWorkspaceLinks(
   repoPaths: Map<string, string>,
   _dbExecutors?: Map<string, CypherExecutor>,
   matchingConfig?: MatchingConfig,
+  options: JavaWorkspaceExtractorOptions = {},
 ): Promise<JavaWorkspaceResult> {
+  const verbose = options.verbose === true;
   const projectsByKey = new Map<string, JavaProjectMeta>();
   const projectsByGroupPath = new Map<string, JavaProjectMeta>();
   const moduleDirToKey = new Map<string, string>();
@@ -1073,6 +1087,7 @@ export async function extractJavaWorkspaceLinks(
       projectsByKey,
       moduleDirToKey,
       projectsByGroupPath,
+      verbose,
     );
     if (!mavenFound) {
       const manifest = await parseJavaManifest(repoPath);
@@ -1133,7 +1148,8 @@ export async function extractJavaWorkspaceLinks(
                     };
                     projectsByKey.set(moduleKey, moduleMeta);
                     moduleDirToKey.set(moduleDir, moduleKey);
-                    logger.info(
+                    logVerboseDiscovery(
+                      verbose,
                       `[java-workspace-extractor] discovered module ${moduleKey} in ${groupPath} (depth ${depth + 1})`,
                     );
                     nextLevel.push({
@@ -1169,7 +1185,8 @@ export async function extractJavaWorkspaceLinks(
       pkgClaimants.get(pkg)!.add(artifactKey);
     }
     if (actualPkgs.size > 0) {
-      logger.info(
+      logVerboseDiscovery(
+        verbose,
         `[java-workspace-extractor] ${artifactKey} exports packages: ${[...actualPkgs].join(', ')}`,
       );
     }

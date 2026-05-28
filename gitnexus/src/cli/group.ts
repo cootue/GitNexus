@@ -152,7 +152,7 @@ export function registerGroupCommands(program: Command): void {
     .option('--skip-embeddings', 'Exact + BM25 only (no embedding fallback)')
     .option('--exact-only', 'Exact match only')
     .option('--allow-stale', 'Skip stale index warnings')
-    .option('--verbose', 'Show each cross-link detail')
+    .option('--verbose', 'Show detailed sync diagnostics and cross-link details')
     .option('--json', 'JSON output')
     .action(async (name: string, opts: Record<string, boolean | undefined>) => {
       const { getGroupDir, getDefaultGitnexusDir } = await import('../core/group/storage.js');
