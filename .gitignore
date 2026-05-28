@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+gitnexus/*.tgz
 
 # TypeScript build info
 *.tsbuildinfo
