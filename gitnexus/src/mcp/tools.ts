@@ -207,7 +207,7 @@ Handles disambiguation: if multiple symbols share the same name, returns ranked 
 
 NOTE: ACCESSES edges (field read/write tracking) are included in context results with reason 'read' or 'write'. CALLS edges resolve through field access chains and method-call chains (e.g., user.address.getCity().save() produces CALLS edges at each step).
 
-GROUP MODE: set "repo" to "@<groupName>" to run context in each member repo (aggregated list), or "@<groupName>/<groupRepoPath>" for one member. If you use "@<groupName>" only, the member defaults to the lexicographically first key in group.yaml "repos".
+GROUP MODE: set "repo" to "@<groupName>" to run context in each member repo (aggregated list), or "@<groupName>/<groupRepoPath>" for one member. If you use "@<groupName>" only, the member defaults to the lexicographically first key in group.yaml "repos". In group mode the result also includes "cross[]": cross-repo neighbors of the symbol resolved via the Contract Bridge (each with direction, contract, resolved flag, and neighbor symbol). manifest:: dead-ends appear as resolved:false/symbol:null (connection visible, not traceable further). Disable with cross_links:false; raise minConfidence to hide low-confidence (0.5 manifest::) links.
 
 SERVICE: optional monorepo path prefix (case-sensitive path segments). When "repo" starts with "@", prefix-matches resolved symbol file paths; when a hit is outside the prefix, that member returns an empty payload for the symbol. Ignored for a normal indexed repo name.`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
@@ -240,6 +240,19 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           minLength: 1,
           description:
             'Optional monorepo service root (relative path). Applies in group mode (@repo) only; ignored for a normal repo name. Empty string is rejected server-side.',
+        },
+        cross_links: {
+          type: 'boolean',
+          description:
+            'Group mode only: include cross-repo neighbors (cross[]) via the Contract Bridge. Default true. Ignored for a normal repo name.',
+          default: true,
+        },
+        minConfidence: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          description:
+            'Group mode only: drop cross-links below this confidence. Default 0 (show all, including 0.5 manifest:: dead-ends).',
         },
       },
       required: [],

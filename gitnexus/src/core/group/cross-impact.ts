@@ -3,10 +3,7 @@
  * All bridge Cypher for this feature lives in this module.
  */
 
-import fsp from 'node:fs/promises';
-import path from 'node:path';
 import type {
-  BridgeHandle,
   ContractType,
   CrossRepoImpact,
   GroupConfig,
@@ -22,52 +19,20 @@ import {
   repoInSubgroup,
 } from './group-path-utils.js';
 import { getGroupDir } from './storage.js';
-import { closeBridgeDb, openBridgeDbReadOnly, queryBridge, readBridgeMeta } from './bridge-db.js';
-import { BRIDGE_SCHEMA_VERSION } from './bridge-schema.js';
+import { closeBridgeDb, queryBridge } from './bridge-db.js';
+import {
+  CY_NEIGHBORS_DOWNSTREAM,
+  CY_NEIGHBORS_UPSTREAM,
+  ensureBridgeReady,
+  rowToNeighbor,
+  type BridgeNeighborRow,
+} from './bridge-neighbors.js';
 
 /** Cross-boundary hops beyond this value are clamped (multi-hop reserved for future work). */
 export const MAX_SUPPORTED_CROSS_DEPTH = 1;
 
 /** Default wall-clock budget for the Phase 1 `impact` leg when callers omit `timeoutMs`. */
 export const DEFAULT_LOCAL_IMPACT_TIMEOUT_MS = 30_000;
-
-const CY_NEIGHBORS_UPSTREAM = `
-MATCH (consumer:Contract)-[l:ContractLink]->(provider:Contract)
-WHERE provider.repo = $localRepo
-  AND provider.symbolUid IN $uids
-  AND provider.role = 'provider'
-RETURN consumer.repo AS neighborRepo,
-       consumer.symbolUid AS neighborUid,
-       consumer.filePath AS neighborFilePath,
-       l.matchType AS matchType,
-       l.confidence AS confidence,
-       l.contractId AS contractId,
-       consumer.type AS contractType
-`;
-
-const CY_NEIGHBORS_DOWNSTREAM = `
-MATCH (consumer:Contract)-[l:ContractLink]->(provider:Contract)
-WHERE consumer.repo = $localRepo
-  AND consumer.symbolUid IN $uids
-  AND consumer.role = 'consumer'
-RETURN provider.repo AS neighborRepo,
-       provider.symbolUid AS neighborUid,
-       provider.filePath AS neighborFilePath,
-       l.matchType AS matchType,
-       l.confidence AS confidence,
-       l.contractId AS contractId,
-       provider.type AS contractType
-`;
-
-type BridgeNeighborRow = {
-  neighborRepo: string;
-  neighborUid: string;
-  neighborFilePath?: string;
-  matchType: string;
-  confidence: number;
-  contractId: string;
-  contractType: string;
-};
 
 export interface RunGroupImpactDeps {
   port: GroupToolPort;
@@ -342,48 +307,6 @@ function mergeRisk(localRisk: string, cross: CrossRepoImpact[]): string {
   if (highConf) return 'HIGH';
   if (cross.length > 0 && (localRisk === 'LOW' || localRisk === 'UNKNOWN')) return 'MEDIUM';
   return localRisk;
-}
-
-async function ensureBridgeReady(
-  groupDir: string,
-): Promise<{ handle: BridgeHandle } | { error: string }> {
-  const meta = await readBridgeMeta(groupDir);
-  if (meta.version > 0 && meta.version !== BRIDGE_SCHEMA_VERSION) {
-    return {
-      error: `Bridge schema version mismatch (meta.json has ${meta.version}, expected ${BRIDGE_SCHEMA_VERSION}). Run gitnexus group sync for this group.`,
-    };
-  }
-  const dbPath = path.join(groupDir, 'bridge.lbug');
-  try {
-    await fsp.access(dbPath);
-  } catch {
-    return {
-      error: `No bridge.lbug in this group directory. Run gitnexus group sync (schema ${BRIDGE_SCHEMA_VERSION}).`,
-    };
-  }
-  const handle = await openBridgeDbReadOnly(groupDir);
-  if (!handle) {
-    return {
-      error: `Could not open bridge.lbug read-only (schema ${BRIDGE_SCHEMA_VERSION}). Run gitnexus group sync.`,
-    };
-  }
-  return { handle };
-}
-
-function rowToNeighbor(r: Record<string, unknown>): BridgeNeighborRow | null {
-  const neighborRepo = String(r.neighborRepo ?? r[0] ?? '');
-  const neighborUid = String(r.neighborUid ?? r[1] ?? '');
-  if (!neighborRepo || !neighborUid) return null;
-  return {
-    neighborRepo,
-    neighborUid,
-    neighborFilePath:
-      r.neighborFilePath !== undefined ? String(r.neighborFilePath) : String(r[2] ?? ''),
-    matchType: String(r.matchType ?? r[3] ?? 'exact'),
-    confidence: Number(r.confidence ?? r[4] ?? 0),
-    contractId: String(r.contractId ?? r[5] ?? ''),
-    contractType: String(r.contractType ?? r[6] ?? 'custom'),
-  };
 }
 
 export async function runGroupImpact(

@@ -3330,6 +3330,9 @@ export class LocalBackend {
         contextArgs.include_content = params.include_content;
       if (params.service !== undefined && params.service !== null)
         contextArgs.service = params.service;
+      if (params.cross_links !== undefined) contextArgs.cross_links = params.cross_links;
+      if (typeof params.minConfidence === 'number')
+        contextArgs.minConfidence = params.minConfidence;
       if (memberRest !== undefined) {
         contextArgs.subgroup = memberRest;
         contextArgs.subgroupExact = true;

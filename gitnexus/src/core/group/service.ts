@@ -388,12 +388,49 @@ export class GroupService {
       }),
     );
 
-    return {
+    const result: GroupContextResult = {
       group: name,
       target: target || uid,
       service: servicePrefix,
       results,
     };
+
+    const crossLinksEnabled = params.cross_links !== false;
+    if (crossLinksEnabled) {
+      const anchorsByRepo = new Map<string, Set<string>>();
+      for (const entry of results) {
+        const payload = entry.payload as { status?: string; symbol?: { uid?: string } } | undefined;
+        if (payload?.status === 'found' && typeof payload.symbol?.uid === 'string') {
+          const set = anchorsByRepo.get(entry.repoPath) ?? new Set<string>();
+          set.add(payload.symbol.uid);
+          anchorsByRepo.set(entry.repoPath, set);
+        }
+      }
+      if (anchorsByRepo.size > 0) {
+        const anchors = [...anchorsByRepo].map(([repoPath, uids]) => ({
+          repoPath,
+          uids: [...uids],
+        }));
+        let minConfidence = typeof params.minConfidence === 'number' ? params.minConfidence : 0;
+        if (minConfidence < 0) minConfidence = 0;
+        if (minConfidence > 1) minConfidence = 1;
+        try {
+          const { runGroupContextCrossLinks } = await import('./cross-context.js');
+          const { cross, truncated } = await runGroupContextCrossLinks(
+            { port: this.port, config, groupDir },
+            anchors,
+            { minConfidence, servicePrefix, subgroup, subgroupExact },
+          );
+          if (cross.length > 0) result.cross = cross;
+          if (truncated) result.truncated = true;
+        } catch {
+          // Soft degradation: bridge/traversal failure leaves per-repo
+          // results intact; cross-links are simply omitted.
+        }
+      }
+    }
+
+    return result;
   }
 
   async groupQuery(params: Record<string, unknown>): Promise<unknown> {

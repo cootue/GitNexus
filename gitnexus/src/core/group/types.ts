@@ -198,6 +198,35 @@ export interface GroupContextResult {
   service?: string;
   error?: string;
   results: GroupContextRepoEntry[];
+  /**
+   * Cross-repo neighbors of the anchor symbol, resolved via the Contract
+   * Bridge (group mode only). Absent when `cross_links` is disabled, no
+   * anchor resolved, or the bridge is unavailable (soft degradation).
+   */
+  cross?: CrossRepoContext[];
+  /** Set when the cross-link fan-out hit `MAX_CONTEXT_NEIGHBORS` and was capped. */
+  truncated?: boolean;
+}
+
+/**
+ * One cross-repo neighbor surfaced by group `context`. Mirrors
+ * `CrossRepoImpact` but carries the neighbor's single-symbol context payload
+ * instead of an impact walk. `resolved:false` / `symbol:null` marks a
+ * `manifest::` dead-end (connection visible, neighbor symbol not in graph).
+ */
+export interface CrossRepoContext {
+  repo: string;
+  repo_path: string;
+  direction: 'upstream' | 'downstream';
+  contract: {
+    id: string;
+    type: ContractType;
+    match_type: MatchType;
+    confidence: number;
+  };
+  resolved: boolean;
+  symbol: { uid: string; name: string; kind?: string; filePath?: string } | null;
+  processes: string[];
 }
 
 export interface CrossRepoImpact {
