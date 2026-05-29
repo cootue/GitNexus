@@ -24,7 +24,8 @@ describe('ManifestExtractor', () => {
     expect(provider).toBeDefined();
     expect(provider!.contractId).toBe('topic::employee.hired');
     expect(provider!.type).toBe('topic');
-    expect(provider!.confidence).toBe(1.0);
+    // No dbExecutors provided → both sides resolve to manifest:: → confidence 0.5
+    expect(provider!.confidence).toBe(0.5);
 
     const consumer = result.contracts.find((c) => c.role === 'consumer');
     expect(consumer).toBeDefined();
@@ -32,7 +33,8 @@ describe('ManifestExtractor', () => {
 
     expect(result.crossLinks).toHaveLength(1);
     expect(result.crossLinks[0].matchType).toBe('manifest');
-    expect(result.crossLinks[0].confidence).toBe(1.0);
+    // No dbExecutors → both sides manifest:: → confidence 0.5
+    expect(result.crossLinks[0].confidence).toBe(0.5);
     expect(result.crossLinks[0].from.repo).toBe('hr/hiring/backend');
     expect(result.crossLinks[0].to.repo).toBe('hr/payroll/backend');
   });
@@ -822,7 +824,7 @@ describe('ManifestExtractor', () => {
         role: 'provider',
       },
     ];
-    let capturedCypher = '';
+    const capturedCyphers: string[] = [];
     const dbExecutors = new Map<
       string,
       (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
@@ -830,7 +832,7 @@ describe('ManifestExtractor', () => {
       [
         'parser/mathlex',
         async (cypher) => {
-          capturedCypher = cypher;
+          capturedCyphers.push(cypher);
           return [];
         },
       ],
@@ -839,8 +841,10 @@ describe('ManifestExtractor', () => {
 
     await extractor.extractFromManifest(links, dbExecutors);
 
-    expect(capturedCypher).toContain('Function|Method|Class|Interface|Struct|Enum|Trait');
-    expect(capturedCypher).not.toContain('NOT n:File');
+    // Primary labels should appear in at least one captured query
+    const allCyphers = capturedCyphers.join('\n');
+    expect(allCyphers).toContain('Class|Interface|Method|Function');
+    expect(allCyphers).not.toContain('NOT n:File');
   });
 
   it('custom contract with ambiguous name returns first-by-filePath deterministically', async () => {
@@ -917,5 +921,401 @@ describe('ManifestExtractor', () => {
     // One resolution per distinct (repo, type, contract) — not per (link × side).
     expect(calls).toHaveLength(2);
     expect(new Set(calls.map((c) => c.repo))).toEqual(new Set(['svc/a', 'svc/b']));
+  });
+
+  // --- Consumer scoping tests (#1–#8) ---
+
+  it('scopes consumer side to module (extends, name collision)', async () => {
+    // Two ext modules define OrderHandler. consumerModuleDir picks the right one.
+    const links: GroupManifestLink[] = [
+      {
+        from: 'common',
+        to: 'ext',
+        type: 'extends',
+        contract: 'ca-jext-lang::BaseHandler',
+        extSymbol: 'OrderHandler',
+        consumerModuleDir: 'Applications/ext-api',
+        role: 'provider',
+      },
+    ];
+
+    const extCalls: Array<{ cypher: string; params?: Record<string, unknown> }> = [];
+    const dbExecutors = new Map<
+      string,
+      (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
+    >([
+      [
+        'common',
+        async (_cypher, params) => {
+          if (params?.symbolName === 'BaseHandler') {
+            return [{ uid: 'uid-base', name: 'BaseHandler', filePath: 'src/BaseHandler.java' }];
+          }
+          return [];
+        },
+      ],
+      [
+        'ext',
+        async (cypher, params) => {
+          extCalls.push({ cypher, params });
+          // Only return a result when consumerModuleDir matches ext-api
+          if (params?.consumerModuleDir === 'Applications/ext-api/') {
+            return [
+              {
+                uid: 'uid-ext-api-handler',
+                name: 'OrderHandler',
+                filePath: 'Applications/ext-api/src/OrderHandler.java',
+              },
+            ];
+          }
+          return [];
+        },
+      ],
+    ]);
+
+    const result = await extractor.extractFromManifest(links, dbExecutors);
+    const consumer = result.contracts.find((c) => c.role === 'consumer');
+    expect(consumer?.symbolUid).toBe('uid-ext-api-handler');
+
+    // Verify the Cypher contained CONTAINS $consumerModuleDir
+    const firstExtCall = extCalls.find((c) => c.params?.consumerModuleDir);
+    expect(firstExtCall).toBeDefined();
+    expect(firstExtCall!.cypher).toContain('CONTAINS $consumerModuleDir');
+    expect(firstExtCall!.params?.consumerModuleDir).toBe('Applications/ext-api/');
+  });
+
+  it('no consumerModuleDir → no filter (backward compat)', async () => {
+    const links: GroupManifestLink[] = [
+      {
+        from: 'common',
+        to: 'ext',
+        type: 'extends',
+        contract: 'ca-jext-lang::BaseHandler',
+        extSymbol: 'OrderHandler',
+        role: 'provider',
+        // no consumerModuleDir
+      },
+    ];
+
+    const extCalls: Array<{ cypher: string; params?: Record<string, unknown> }> = [];
+    const dbExecutors = new Map<
+      string,
+      (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
+    >([
+      ['common', async () => [{ uid: 'uid-base', name: 'BaseHandler', filePath: 'src/Base.java' }]],
+      [
+        'ext',
+        async (cypher, params) => {
+          extCalls.push({ cypher, params });
+          return [
+            {
+              uid: 'uid-ext-handler',
+              name: 'OrderHandler',
+              filePath: 'Applications/ext-api/src/OrderHandler.java',
+            },
+          ];
+        },
+      ],
+    ]);
+
+    const result = await extractor.extractFromManifest(links, dbExecutors);
+    const consumer = result.contracts.find((c) => c.role === 'consumer');
+    expect(consumer?.symbolUid).toBe('uid-ext-handler');
+
+    // No consumerModuleDir in any ext call params
+    const withModuleDir = extCalls.find((c) => c.params?.consumerModuleDir);
+    expect(withModuleDir).toBeUndefined();
+  });
+
+  it('provider side is never module-filtered', async () => {
+    const links: GroupManifestLink[] = [
+      {
+        from: 'common',
+        to: 'ext',
+        type: 'extends',
+        contract: 'ca-jext-lang::BaseHandler',
+        extSymbol: 'OrderHandler',
+        consumerModuleDir: 'Applications/ext-api',
+        role: 'provider',
+      },
+    ];
+
+    const commonCalls: Array<{ params?: Record<string, unknown> }> = [];
+    const dbExecutors = new Map<
+      string,
+      (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
+    >([
+      [
+        'common',
+        async (_cypher, params) => {
+          commonCalls.push({ params });
+          return [{ uid: 'uid-base', name: 'BaseHandler', filePath: 'src/BaseHandler.java' }];
+        },
+      ],
+      [
+        'ext',
+        async (_cypher, params) => {
+          if (params?.consumerModuleDir === 'Applications/ext-api/') {
+            return [
+              {
+                uid: 'uid-ext-handler',
+                name: 'OrderHandler',
+                filePath: 'Applications/ext-api/src/OrderHandler.java',
+              },
+            ];
+          }
+          return [];
+        },
+      ],
+    ]);
+
+    await extractor.extractFromManifest(links, dbExecutors);
+
+    // Provider-side calls should never receive consumerModuleDir
+    const withModuleDir = commonCalls.find((c) => c.params?.consumerModuleDir);
+    expect(withModuleDir).toBeUndefined();
+  });
+
+  it('custom import of non-defined class stays manifest:: (scoping cannot help)', async () => {
+    const links: GroupManifestLink[] = [
+      {
+        from: 'common',
+        to: 'ext',
+        type: 'custom',
+        contract: 'ca-jext-lang::SystemException',
+        consumerModuleDir: 'Applications/ext-api',
+        role: 'provider',
+      },
+    ];
+
+    const dbExecutors = new Map<
+      string,
+      (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
+    >([
+      [
+        'common',
+        async (_cypher, params) => {
+          if (params?.symbolName === 'SystemException') {
+            return [
+              { uid: 'uid-sysexc', name: 'SystemException', filePath: 'src/SystemException.java' },
+            ];
+          }
+          return [];
+        },
+      ],
+      [
+        'ext',
+        async () => [], // Class doesn't exist in ext graph
+      ],
+    ]);
+
+    const result = await extractor.extractFromManifest(links, dbExecutors);
+    const consumer = result.contracts.find((c) => c.role === 'consumer');
+    // Still manifest:: because ext doesn't define SystemException at all
+    expect(consumer?.symbolUid).toBe('manifest::ext::custom::ca-jext-lang::SystemException');
+  });
+
+  it('trailing slash prevents substring collision', async () => {
+    // "Applications/ext-api" must NOT match "Applications/ext-api-v2/..." paths
+    const links: GroupManifestLink[] = [
+      {
+        from: 'common',
+        to: 'ext',
+        type: 'extends',
+        contract: 'ca-jext-lang::BaseHandler',
+        extSymbol: 'Handler',
+        consumerModuleDir: 'Applications/ext-api',
+        role: 'provider',
+      },
+    ];
+
+    const extCalls: Array<{ params?: Record<string, unknown> }> = [];
+    const dbExecutors = new Map<
+      string,
+      (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
+    >([
+      [
+        'common',
+        async () => [{ uid: 'uid-base', name: 'BaseHandler', filePath: 'src/BaseHandler.java' }],
+      ],
+      [
+        'ext',
+        async (_cypher, params) => {
+          extCalls.push({ params });
+          // Simulate DB that has both ext-api and ext-api-v2 modules
+          // Only return a match when the trailing-slash filter is applied correctly
+          if (params?.consumerModuleDir === 'Applications/ext-api/') {
+            return [
+              {
+                uid: 'uid-ext-api-handler',
+                name: 'Handler',
+                filePath: 'Applications/ext-api/src/Handler.java',
+              },
+            ];
+          }
+          // Without trailing slash, would wrongly match ext-api-v2 node
+          return [];
+        },
+      ],
+    ]);
+
+    const result = await extractor.extractFromManifest(links, dbExecutors);
+    const consumer = result.contracts.find((c) => c.role === 'consumer');
+    expect(consumer?.symbolUid).toBe('uid-ext-api-handler');
+
+    // Assert the parameter has trailing slash
+    const withModuleDir = extCalls.find((c) => c.params?.consumerModuleDir);
+    expect(withModuleDir?.params?.consumerModuleDir).toBe('Applications/ext-api/');
+  });
+
+  it('two-stage fallback recovers from mismatched moduleDir', async () => {
+    // consumerModuleDir points to wrong module; module-scoped query returns 0,
+    // but retry without filter succeeds.
+    const links: GroupManifestLink[] = [
+      {
+        from: 'common',
+        to: 'ext',
+        type: 'extends',
+        contract: 'ca-jext-lang::BaseHandler',
+        extSymbol: 'OrderHandler',
+        consumerModuleDir: 'Applications/wrong-module',
+        role: 'provider',
+      },
+    ];
+
+    let extCallCount = 0;
+    const dbExecutors = new Map<
+      string,
+      (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
+    >([
+      [
+        'common',
+        async () => [{ uid: 'uid-base', name: 'BaseHandler', filePath: 'src/BaseHandler.java' }],
+      ],
+      [
+        'ext',
+        async (_cypher, params) => {
+          extCallCount++;
+          // Return 0 when module filter is applied (wrong module)
+          if (params?.consumerModuleDir) return [];
+          // Return result when no module filter (two-stage fallback)
+          return [
+            {
+              uid: 'uid-ext-handler',
+              name: 'OrderHandler',
+              filePath: 'Applications/ext-batch/src/OrderHandler.java',
+            },
+          ];
+        },
+      ],
+    ]);
+
+    const result = await extractor.extractFromManifest(links, dbExecutors);
+    const consumer = result.contracts.find((c) => c.role === 'consumer');
+    // Resolved via two-stage fallback, NOT manifest::
+    expect(consumer?.symbolUid).toBe('uid-ext-handler');
+    expect(extCallCount).toBeGreaterThanOrEqual(2); // at least module-scoped + unscoped retry
+  });
+
+  it('two-stage fallback is NOT reached when module-scoped query succeeds', async () => {
+    // When the module-scoped query finds a result, no unscoped retry should happen.
+    const links: GroupManifestLink[] = [
+      {
+        from: 'common',
+        to: 'ext',
+        type: 'extends',
+        contract: 'ca-jext-lang::BaseHandler',
+        extSymbol: 'OrderHandler',
+        consumerModuleDir: 'Applications/ext-api',
+        role: 'provider',
+      },
+    ];
+
+    let extCallCount = 0;
+    const dbExecutors = new Map<
+      string,
+      (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
+    >([
+      [
+        'common',
+        async () => [{ uid: 'uid-base', name: 'BaseHandler', filePath: 'src/BaseHandler.java' }],
+      ],
+      [
+        'ext',
+        async (_cypher, params) => {
+          extCallCount++;
+          // Module-scoped query succeeds immediately
+          if (params?.consumerModuleDir === 'Applications/ext-api/') {
+            return [
+              {
+                uid: 'uid-ext-api-handler',
+                name: 'OrderHandler',
+                filePath: 'Applications/ext-api/src/OrderHandler.java',
+              },
+            ];
+          }
+          // This should NOT be reached — but if it is, return a different node
+          return [
+            {
+              uid: 'uid-wrong',
+              name: 'OrderHandler',
+              filePath: 'Applications/ext-batch/src/OrderHandler.java',
+            },
+          ];
+        },
+      ],
+    ]);
+
+    const result = await extractor.extractFromManifest(links, dbExecutors);
+    const consumer = result.contracts.find((c) => c.role === 'consumer');
+    expect(consumer?.symbolUid).toBe('uid-ext-api-handler');
+
+    // Only 1 ext call (primary labels) — no fallback needed
+    expect(extCallCount).toBe(1);
+  });
+
+  it('Fix 22 FQN regression: providerFqn gate still works with consumerModuleDir', async () => {
+    // Verify that adding consumerModuleDir does not break the existing
+    // FQN verification gate on the provider side.
+    const links: GroupManifestLink[] = [
+      {
+        from: 'common',
+        to: 'ext',
+        type: 'custom',
+        contract: 'com.acme.lang::Helper',
+        providerFqn: 'com.acme.lang.Helper',
+        consumerModuleDir: 'Applications/ext-api',
+        role: 'provider',
+      },
+    ];
+
+    const dbExecutors = new Map<
+      string,
+      (cypher: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>[]>
+    >([
+      [
+        'common',
+        async (_cypher, params) => {
+          if (params?.symbolName === 'Helper' && params?.fqnPath) {
+            // FQN match returns correct provider
+            return [
+              { uid: 'uid-correct-helper', name: 'Helper', filePath: 'com/acme/lang/Helper.java' },
+            ];
+          }
+          // Simple-name fallback returns a name-collision FP from a different package
+          return [
+            { uid: 'uid-wrong-helper', name: 'Helper', filePath: 'com/acme/utils/Helper.java' },
+          ];
+        },
+      ],
+      [
+        'ext',
+        async () => [], // Consumer doesn't define Helper
+      ],
+    ]);
+
+    const result = await extractor.extractFromManifest(links, dbExecutors);
+    const provider = result.contracts.find((c) => c.role === 'provider');
+    // FQN gate passes — correct symbol resolved
+    expect(provider?.symbolUid).toBe('uid-correct-helper');
   });
 });

@@ -297,6 +297,15 @@ export class ManifestExtractor {
     const executor = dbExecutors?.get(repoPathKey);
     if (!executor) return null;
 
+    // Consumer-side module scoping. consumerModuleDir is only meaningful when
+    // THIS call is resolving the consumer repo — on the provider repo it would
+    // wrongly filter a graph where that module path doesn't exist.
+    const consumerRepo = link.role === 'provider' ? link.to : link.from;
+    const consumerModuleDir =
+      repoPathKey === consumerRepo && link.consumerModuleDir
+        ? link.consumerModuleDir.replace(/\\/g, '/') // defensive normalize (elixir/rust extractors)
+        : null;
+
     try {
       let rows: Record<string, unknown>[];
       if (link.type === 'http') {
@@ -376,20 +385,21 @@ export class ManifestExtractor {
         const fqnPath = link.providerFqn
           ? link.providerFqn.replace(/\./g, '/').replace(/\/[^/]*$/, '')
           : null;
-        rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
-          'Class',
-          'Interface',
-          'Method',
-          'Function',
-        ]);
+        rows = await this.queryWithFqnDisambiguation(
+          executor,
+          symbolName,
+          fqnPath,
+          ['Class', 'Interface', 'Method', 'Function'],
+          consumerModuleDir,
+        );
         if (rows.length === 0) {
-          rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
-            'Enum',
-            'Struct',
-            'Trait',
-            'Constructor',
-            'CodeElement',
-          ]);
+          rows = await this.queryWithFqnDisambiguation(
+            executor,
+            symbolName,
+            fqnPath,
+            ['Enum', 'Struct', 'Trait', 'Constructor', 'CodeElement'],
+            consumerModuleDir,
+          );
         }
       } else if (
         link.type === 'extends' ||
@@ -413,20 +423,21 @@ export class ManifestExtractor {
           isProvider && link.providerFqn
             ? link.providerFqn.replace(/\./g, '/').replace(/\/[^/]*$/, '')
             : null;
-        rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
-          'Class',
-          'Interface',
-          'Method',
-          'Function',
-        ]);
+        rows = await this.queryWithFqnDisambiguation(
+          executor,
+          symbolName,
+          fqnPath,
+          ['Class', 'Interface', 'Method', 'Function'],
+          consumerModuleDir,
+        );
         if (rows.length === 0) {
-          rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
-            'Enum',
-            'Struct',
-            'Trait',
-            'Constructor',
-            'CodeElement',
-          ]);
+          rows = await this.queryWithFqnDisambiguation(
+            executor,
+            symbolName,
+            fqnPath,
+            ['Enum', 'Struct', 'Trait', 'Constructor', 'CodeElement'],
+            consumerModuleDir,
+          );
         }
       } else if (link.type === 'xml-ref') {
         // Fix 15d: xml-ref consumer side is a resource file (not a graph
@@ -441,20 +452,21 @@ export class ManifestExtractor {
         const fqnPath = link.providerFqn
           ? link.providerFqn.replace(/\./g, '/').replace(/\/[^/]*$/, '')
           : null;
-        rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
-          'Class',
-          'Interface',
-          'Method',
-          'Function',
-        ]);
+        rows = await this.queryWithFqnDisambiguation(
+          executor,
+          symbolName,
+          fqnPath,
+          ['Class', 'Interface', 'Method', 'Function'],
+          consumerModuleDir,
+        );
         if (rows.length === 0) {
-          rows = await this.queryWithFqnDisambiguation(executor, symbolName, fqnPath, [
-            'Enum',
-            'Struct',
-            'Trait',
-            'Constructor',
-            'CodeElement',
-          ]);
+          rows = await this.queryWithFqnDisambiguation(
+            executor,
+            symbolName,
+            fqnPath,
+            ['Enum', 'Struct', 'Trait', 'Constructor', 'CodeElement'],
+            consumerModuleDir,
+          );
         }
       } else {
         return null;
@@ -500,27 +512,52 @@ export class ManifestExtractor {
    * the expected package path. If that returns 0 results, fall back to
    * simple-name-only matching (backward compatible). The caller's FQN
    * verification gate then rejects any name-collision FP from the fallback.
+   *
+   * Consumer scoping: consumerModuleDir narrows the query to the module
+   * that declared the dependency. Trailing slash prevents substring
+   * collision (e.g. "ext-api" matching "ext-api-v2"). Two-stage fallback:
+   * when module-scoped queries return 0 rows, retry without the module
+   * filter to prevent TP degradation (resolved→manifest::).
    */
   private async queryWithFqnDisambiguation(
     executor: CypherExecutor,
     symbolName: string,
     fqnPath: string | null,
     labels: string[],
+    consumerModuleDir?: string | null,
   ): Promise<Record<string, unknown>[]> {
     const labelStr = labels.join('|');
+    // Trailing slash prevents substring collision (e.g. "ext-api" matching "ext-api-v2").
+    const dirFilter = consumerModuleDir ? `${consumerModuleDir.replace(/\/?$/, '/')}` : null;
+    const moduleFilter = dirFilter ? ' AND n.filePath CONTAINS $consumerModuleDir' : '';
+    const moduleParam = dirFilter ? { consumerModuleDir: dirFilter } : {};
+
     if (fqnPath) {
-      // Primary: FQN-constrained query for exact package match.
+      // Primary: FQN-constrained query (+ module filter if set).
       const rows = await executor(
-        `MATCH (n:${labelStr}) WHERE n.name = $symbolName AND n.filePath CONTAINS $fqnPath
+        `MATCH (n:${labelStr}) WHERE n.name = $symbolName AND n.filePath CONTAINS $fqnPath${moduleFilter}
          RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
          ORDER BY n.filePath ASC
          LIMIT 1`,
-        { symbolName, fqnPath },
+        { symbolName, fqnPath, ...moduleParam },
       );
       if (rows.length > 0) return rows;
-      // Fallback: simple-name query when FQN-constrained finds nothing.
-      // The verification gate in resolveSymbol will reject name-collision FPs.
     }
+    // Fallback: simple-name + module filter (if set).
+    const fallbackRows = await executor(
+      `MATCH (n:${labelStr}) WHERE n.name = $symbolName${moduleFilter}
+       RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
+       ORDER BY n.filePath ASC
+       LIMIT 1`,
+      { symbolName, ...moduleParam },
+    );
+    if (fallbackRows.length > 0 || !dirFilter) return fallbackRows;
+
+    // Two-stage fallback: module filter yielded 0 rows — retry without it
+    // to prevent TP degradation (resolved→manifest::). The provider-side
+    // FQN gate handles FP on that side; on consumer side the risk of
+    // wrong-module FP is lower than the risk of losing a correct
+    // resolution entirely.
     return executor(
       `MATCH (n:${labelStr}) WHERE n.name = $symbolName
        RETURN n.id AS uid, n.name AS name, n.filePath AS filePath
