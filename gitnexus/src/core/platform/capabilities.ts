@@ -81,7 +81,7 @@ export const getVectorPlatformReason = (
   if (isWin32VectorRolloutEnabled(env)) {
     return (
       'LadybugDB VECTOR on Windows is enabled by default. ' +
-      `set ${WIN32_VECTOR_DISABLE_ENV}=1 to force exact scan fallback.`
+      `Set ${WIN32_VECTOR_DISABLE_ENV}=1 to force exact scan fallback.`
     );
   }
   return undefined;
